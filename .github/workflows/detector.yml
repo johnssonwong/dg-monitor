@@ -1,0 +1,49 @@
+name: DG Baccarat Detector
+
+on:
+  schedule:
+    # 每 5 分钟运行一次（分钟设定受 GitHub 最小单位限制，请按需调整）
+    - cron:  '*/5 * * * *'
+  workflow_dispatch:
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          # Playwright 安装浏览器
+          playwright install chromium
+
+      - name: Run detector
+        env:
+          TELEGRAM_BOT_TOKEN: 8134230045:AAH6C_H53R_J2RH98fGTqZFHsjkKALhsTh8
+          TELEGRAM_CHAT_ID: 485427847
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python detector.py || true
+
+      - name: Commit state changes (if any)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if [ -n "$(git status --porcelain)" ]; then
+            git add state.json || true
+            if git commit -m "Update detector state [skip ci]" || true; then
+              git push origin HEAD:$(echo "${GITHUB_REF#refs/heads/}" || echo "main") || true
+            fi
+          else
+            echo "No changes to commit"
+          fi
