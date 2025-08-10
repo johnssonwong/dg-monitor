@@ -1,68 +1,40 @@
-name: DG Monitor
+name: DG Monitor (every 5 minutes)
 
 on:
   schedule:
-    - cron: "*/5 * * * *"  # 每5分钟运行一次
-  workflow_dispatch: # 手动触发
+    - cron: '*/5 * * * *'   # 每 5 分钟执行一次
+  workflow_dispatch:
+
+permissions:
+  contents: write   # 允许写回 repo（state.json）
 
 jobs:
-  check-dg:
+  run-detector:
     runs-on: ubuntu-latest
-
     steps:
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: "3.x"
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
 
-    - name: Install dependencies
-      run: pip install requests selenium webdriver-manager
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
 
-    - name: Run DG Monitoring Script
-      run: |
-        import os, time, requests
-        from selenium import webdriver
-        from selenium.webdriver.chrome.service import Service
-        from selenium.webdriver.common.by import By
-        from webdriver_manager.chrome import ChromeDriverManager
+      - name: Install deps & Playwright browsers
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          python -m playwright install --with-deps
 
-        TELEGRAM_TOKEN = "8134230045:AAH6C_H53R_J2RH98fGTqZFHsjkKALhsTh8"
-        TELEGRAM_CHAT_ID = "485427847"
-        DG_URLS = ["https://dg18.co/wap/", "https://dg18.co/"]
-
-        def send_telegram_message(message):
-            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-            payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
-            requests.post(url, data=payload)
-
-        def detect_dg():
-            options = webdriver.ChromeOptions()
-            options.add_argument("--headless=new")
-            driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
-
-            try:
-                driver.get(DG_URLS[0])
-                time.sleep(5)
-
-                # 点击“免费试玩”或 Free
-                try:
-                    btn = driver.find_element(By.XPATH, "//button[contains(text(),'免费试玩') or contains(text(),'Free')]")
-                    btn.click()
-                    time.sleep(5)
-                except:
-                    pass
-
-                # TODO: 这里需要你按你的状况A / 放水逻辑解析台桌走势
-                # 下面只是示例
-                page_source = driver.page_source
-                if "长龙" in page_source or "多连" in page_source:
-                    send_telegram_message("🔥 放水时段（提高胜率）检测到！快入场！")
-                elif "中等胜率" in page_source:
-                    send_telegram_message("⚡ 中等胜率（中上）检测到，可以留意入场。")
-                else:
-                    print("无入场机会")
-
-            finally:
-                driver.quit()
-
-        detect_dg()
+      - name: Run detector
+        env:
+          TELEGRAM_TOKEN: 8134230045:AAH6C_H53R_J2RH98fGTqZFHsjkKALhsTh8
+          TELEGRAM_CHAT_ID: 485427847
+          DG_URL_1: https://dg18.co/wap/
+          DG_URL_2: https://dg18.co/
+          TZ: "Asia/Kuala_Lumpur"
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python detector.py
