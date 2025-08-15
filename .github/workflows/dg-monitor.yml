@@ -36,7 +36,6 @@ jobs:
           cat > monitor.py <<'PY'
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
 - 每次运行会：
   1) 进入 https://dg18.co/wap/ 或 https://dg18.co/ -> 点击 Free/免费试玩 -> 尝试解决滑块
   2) 抓取屏幕内所有 canvas 截图（或可用的走势区域截图）
