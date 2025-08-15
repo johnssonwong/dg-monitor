@@ -36,7 +36,7 @@ jobs:
           cat > monitor.py <<'PY'
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
+
 DG 自动检测最终版（按用户所有规则）
 - 每次运行会：
   1) 进入 https://dg18.co/wap/ 或 https://dg18.co/ -> 点击 Free/免费试玩 -> 尝试解决滑块
