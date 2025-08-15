@@ -1,24 +1,17 @@
 # monitor.py
 # DreamGaming (DG) 自动监测脚本（供 GitHub Actions 运行）
-# 功能：
-# - 自动打开 DG（两个可选 URL），尝试点击 "Free"/"免费试玩" 并滚动安全条
-# - 截取页面上可能的路单（canvas 或包含路单的 div）
-# - 对每个“桌面”截图做颜色/列/竖向连续 run 分析，统计长连/长龙/超长龙/满盘密集度
-# - 按你提供的所有判定规则（放水 / 中等胜率（中上） / 胜率中等 / 收割）判断局势
-# - 当判定为“放水”或“中等胜率（中上）”时发送 Telegram 警报（并截图）
-# - 当放水结束时发送“放水已结束，共持续 XX 分钟”并把本次时长写入历史（用于下次估计）
-#
-# 请在 GitHub Actions 的 workflow 中通过 Secrets 注入下列环境变量：
-# - TELEGRAM_BOT_TOKEN  （你的 bot token）
-# - TELEGRAM_CHAT_ID    （你的 chat id）
-# - DG_URL1 （可选，默认为 https://dg18.co/wap/）
-# - DG_URL2 （可选，默认为 https://dg18.co/）
-#
-# 注意：脚本尽力自动处理跳出页面与简单滑动，但若遇到复杂真人滑块/反自动化时会失败并报告失败需要人工干预。
-# ------------------------------------------------------------------------------
+# 变更说明：所有显示/估算时间均以马来西亚时区 (Asia/Kuala_Lumpur, UTC+8) 输出。
 
 import os, time, json, math, statistics
-from datetime import datetime
+from datetime import datetime, timedelta
+try:
+    from zoneinfo import ZoneInfo
+    MALAYSIA_TZ = ZoneInfo("Asia/Kuala_Lumpur")
+except Exception:
+    # fallback to fixed offset if zoneinfo not available
+    from datetime import timezone
+    MALAYSIA_TZ = timezone(timedelta(hours=8))
+
 import requests
 import numpy as np
 from PIL import Image
@@ -307,8 +300,12 @@ def main():
 
     result = classify_tables(table_metrics)
     label = result.get("label")
-    now_ts = int(time.time())
-    now_str = datetime.fromtimestamp(now_ts).strftime("%Y-%m-%d %H:%M:%S")
+
+    # 使用马来西亚时区时间显示
+    now_dt = datetime.now(MALAYSIA_TZ)
+    now_ts = int(now_dt.timestamp())
+    now_str = now_dt.strftime("%Y-%m-%d %H:%M:%S %Z")
+
     prev_status = state.get("status", "idle")
     prev_alert = state.get("alert_type")
 
@@ -326,14 +323,14 @@ def main():
                 est = int(statistics.mean(hist))
             else:
                 est = 12
-            est_end = now_ts + est*60
-            est_end_str = datetime.fromtimestamp(est_end).strftime("%H:%M:%S")
+            est_end_dt = now_dt + timedelta(minutes=est)
+            est_end_str = est_end_dt.strftime("%H:%M:%S %Z")
             caption = (f"▶️ <b>检测到 放水/中高胜率（开始）</b>\n\n"
                        f"类型: {label}\n"
-                       f"时间: {now_str}\n"
+                       f"时间（MYT）: {now_str}\n"
                        f"检测桌数: {result.get('total_tables')}，符合(满盘/长连)数: {result.get('cnt_full_like')}\n"
                        f"长龙(>=8): {result.get('cnt_long')}，超长龙(>=10): {result.get('cnt_superlong')}\n\n"
-                       f"预计持续(基于历史估计): {est} 分钟\n预计结束(估计): {est_end_str}\n\n"
+                       f"预计持续(基于历史估计): {est} 分钟\n预计结束(估计，MYT): {est_end_str}\n\n"
                        f"说明：使用你提供的判定规则（满盘长连 / 超长龙触发等）。")
             try:
                 send_telegram_photo(board_imgs[0], caption)
@@ -347,7 +344,11 @@ def main():
         # 非提醒时段
         if prev_status == "running_alert":
             start_ts = state.get("start_ts")
-            duration_min = max(1, int((now_ts - (start_ts or now_ts))/60))
+            if start_ts:
+                start_dt = datetime.fromtimestamp(start_ts, MALAYSIA_TZ)
+                duration_min = max(1, int((now_dt - start_dt).total_seconds() / 60))
+            else:
+                duration_min = 0
             hist = state.get("history_minutes", [])
             hist.append(duration_min)
             if len(hist) > 50: hist = hist[-50:]
@@ -357,7 +358,7 @@ def main():
             state["start_ts"] = None
             save_state(state)
             commit_state_git()
-            caption = (f"⏸️ 放水/中高胜率 已结束\n结束时间: {now_str}\n实际持续: {duration_min} 分钟\n检测桌数: {result.get('total_tables')}\n已将本次持续加入历史用于以后估算。")
+            caption = (f"⏸️ 放水/中高胜率 已结束\n结束时间（MYT）: {now_str}\n实际持续: {duration_min} 分钟\n检测桌数: {result.get('total_tables')}\n已将本次持续加入历史用于以后估算。")
             send_telegram_text(caption)
         else:
             print("非提醒时段，未在 alert 中，未发送通知。")
