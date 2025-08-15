@@ -1,0 +1,8 @@
+运行异常：list index out of range
+Traceback (most recent call last):
+  File "/home/runner/work/dg-auto-monitor/dg-auto-monitor/monitor.py", line 499, in <module>
+    main()
+  File "/home/runner/work/dg-auto-monitor/dg-auto-monitor/monitor.py", line 446, in main
+    history = history[-24]  # 保留近24条（约2小时）
+              ~~~~~~~^^^^^
+IndexError: list index out of range
