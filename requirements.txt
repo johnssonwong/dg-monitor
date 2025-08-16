@@ -1,0 +1,5 @@
+playwright>=1.40.0
+opencv-python-headless
+numpy
+Pillow
+requests
