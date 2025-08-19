@@ -1,410 +1,397 @@
 # monitor.py
-import os, sys, json, time, math, subprocess, shutil
+# 说明：在 GitHub Actions 上运行，每次抓取 DG 页面截图并做图像判定。
+# 环境变量：
+#   TG_TOKEN  - Telegram bot token  (推荐通过 GitHub Secrets 设置)
+#   TG_CHAT   - Telegram chat id    (推荐通过 GitHub Secrets 设置)
+#   DG_URL_1, DG_URL_2 - 可选，已在 workflow 中设置
+#
+# state.json 会写回到仓库以记录是否当前处于"放水中"及开始时间 (便于计算结束时长)
+
+import os, json, time, math, traceback, io
 from datetime import datetime, timezone, timedelta
+import requests
+from pathlib import Path
+
+# Playwright headless
+from playwright.sync_api import sync_playwright
+
+# image libs
 import numpy as np
 import cv2
 from PIL import Image
-import requests
 
-# ---------- ========== CONFIG ========== ----------
-# YOUR provided Telegram (auto-filled)
-DEFAULT_TELEGRAM_TOKEN = "8134230045:AAH6C_H53R_J2RH98fGTqZFHsjkKALhsTh8"
-DEFAULT_CHAT_ID = "485427847"
-
-# Default DG links (per your request)
-DG_LINKS = [
-    "https://dg18.co/wap/",
-    "https://dg18.co/"
-]
-
-# Image processing thresholds (can be tuned)
-BLUE_HSV_LOW = np.array([90, 50, 50])
-BLUE_HSV_HIGH = np.array([140, 255, 255])
-RED_HSV_LOW1 = np.array([0, 50, 50])
-RED_HSV_HIGH1 = np.array([10, 255, 255])
-RED_HSV_LOW2 = np.array([160, 50, 50])
-RED_HSV_HIGH2 = np.array([179, 255, 255])
-
-# How many consecutive runs of single-jumps to ignore for "放水判定"
-IGNORE_SINGLE_JUMP_CONSECUTIVE = 3
-
-# Where to save screenshots / state
-OUT_DIR = "work"
-os.makedirs(OUT_DIR, exist_ok=True)
+# ---------- 配置（你可以按需改） -------------
+TG_TOKEN = os.environ.get('TG_TOKEN', '')  # 推荐通过 GitHub Secrets 注入
+TG_CHAT  = os.environ.get('TG_CHAT', '')
+DG_URLS = [ os.environ.get('DG_URL_1', 'https://dg18.co/wap/'),
+            os.environ.get('DG_URL_2', 'https://dg18.co/') ]
+# 判定阈值
+MIN_BOARDS_FOR_PUTTING = int(os.environ.get('MIN_BOARDS', '3'))  # 放水判定：至少3张桌满足长龙条件
+MID_LONG_REQ = int(os.environ.get('MID_LONG_COUNT', '2'))      # 中等胜率需要至少2张长龙
+COOLDOWN_MINUTES = int(os.environ.get('COOLDOWN', '8'))       # 触发提醒后的冷却时间(分钟)
 STATE_FILE = "state.json"
+# ----------------------------------------------
 
-# Telegram usage (you can leave as defaults or set via env)
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN") or DEFAULT_TELEGRAM_TOKEN
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID") or DEFAULT_CHAT_ID
+# 如果没有在 env 里设置 token/chat，你可以把它直接写在这里（不推荐）
+# TG_TOKEN = '8134230045:AAH6C_H53R_J2RH98fGTqZFHsjkKALhsTh8'
+# TG_CHAT  = '485427847'
 
-# -------- Table bounding boxes (calibration required) ----------
-# IMPORTANT: 必须校准：下面是示例模板（x,y,w,h 的 list），
-# 每个 entry 对应页面上一个小桌子的 bounding box（在完整截图内的像素坐标）。
-# 初次部署时，建议把脚本设为 calibration 模式来产出一张全页截图，然后手动测量每张桌的位置并写入这里。
-# 你也可以放入 0 个 box，脚本会尝试 "自动分割" 但不保证稳定。
-#
-# 示例格式:
-TABLE_BOXES = [
-    # [x, y, w, h],  # 第1桌 (左上坐标 x,y + 宽高)
-    # [x2, y2, w2, h2],
-]
-# ---------- end CONFIG ----------
+# ----------------- 辅助函数 ------------------
+def log(msg):
+    print(f"[{datetime.now().astimezone()}] {msg}")
 
-# ---------- Helper functions ----------
-def send_telegram(text, token=TELEGRAM_TOKEN, chat_id=TELEGRAM_CHAT_ID):
+def send_telegram(text):
+    token = TG_TOKEN
+    chat = TG_CHAT
+    if not token or not chat:
+        log("Telegram token/chat 未配置，跳过发送。")
+        return False, "no-token"
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    data = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
     try:
-        r = requests.post(url, data=data, timeout=15)
-        return r.status_code, r.text
+        r = requests.post(url, json={"chat_id": chat, "text": text})
+        if r.status_code == 200:
+            log("Telegram 已发送")
+            return True, r.json()
+        else:
+            log(f"Telegram 发送失败: {r.status_code} {r.text}")
+            return False, r.text
     except Exception as e:
-        return None, str(e)
+        log("Telegram 发送异常: " + str(e))
+        return False, str(e)
 
-def screenshot_and_save(page, fname):
-    page.screenshot(path=fname, full_page=True)
+# 读取/写入 state.json（用于记录是否处在放水中、开始时间）
+def read_state():
+    p = Path(STATE_FILE)
+    if not p.exists():
+        return {"in_water": False, "start_ts": None, "last_alert_ts": None}
+    try:
+        return json.loads(p.read_text())
+    except:
+        return {"in_water": False, "start_ts": None, "last_alert_ts": None}
 
-def now_str():
-    return datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S %Z")
+def write_state(st):
+    Path(STATE_FILE).write_text(json.dumps(st))
 
-# ---------- Image analysis functions ----------
-def detect_color_circles(img_bgr):
+# 将 state.json commit 回 repo（由 Actions 的 GITHUB_TOKEN 提交）
+def commit_state_back():
+    try:
+        # 简单 git commit push
+        os.system('git config user.name "github-actions[bot]"')
+        os.system('git config user.email "41898282+github-actions[bot]@users.noreply.github.com"')
+        os.system('git add ' + STATE_FILE)
+        os.system('git commit -m "update dg monitor state" || echo "no changes"')
+        # use provided GITHUB_TOKEN credential (actions/checkout persisted) to push
+        os.system('git push origin HEAD:main || git push')
+    except Exception as e:
+        log("commit state 异常：" + str(e))
+
+# ---------- 图像处理/检测函数 (简化) ------------
+# 目标： 对截图中的红/蓝点做 blob 检测，聚类到若干“board regions”，
+# 对每个 region 计算 flattened bead sequence (左列到右列，上到下),
+# 计算每个 region 的最大连续 run 长度 (maxRun) -> 用于判断长连/长龙/超长龙。
+
+def pil_to_cv(img_pil):
+    return cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
+
+def get_red_blue_centers(cv_img):
     """
-    基本检测：找出红色和蓝色圆点的位置（返回列表）
-    img_bgr: OpenCV image (BGR)
-    return: dict with 'blue': [(x,y),...], 'red': [(x,y),...]
+    输入 BGR 图像，返回所有检测到的（x,y,color）中心点
+    color in {'B' (banker/red), 'P' (player/blue)}
+    注意：颜色阈值需要根据实际截图微调
     """
-    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
-    mask_blue = cv2.inRange(hsv, BLUE_HSV_LOW, BLUE_HSV_HIGH)
-    mask_red1 = cv2.inRange(hsv, RED_HSV_LOW1, RED_HSV_HIGH1)
-    mask_red2 = cv2.inRange(hsv, RED_HSV_LOW2, RED_HSV_HIGH2)
-    mask_red = cv2.bitwise_or(mask_red1, mask_red2)
-    # optional: morphological
+    h, w = cv_img.shape[:2]
+    hsv = cv2.cvtColor(cv_img, cv2.COLOR_BGR2HSV)
+    # 红色（Banker）阈值（HSV） - 可微调
+    lower_r1 = np.array([0, 80, 40]); upper_r1 = np.array([10, 255, 255])
+    lower_r2 = np.array([170,80,40]); upper_r2 = np.array([180,255,255])
+    mask_r = cv2.inRange(hsv, lower_r1, upper_r1) | cv2.inRange(hsv, lower_r2, upper_r2)
+    # 蓝色（Player）阈值
+    lower_b = np.array([90,60,30]); upper_b = np.array([140,255,255])
+    mask_b = cv2.inRange(hsv, lower_b, upper_b)
+    # 清理噪声
     kernel = np.ones((3,3), np.uint8)
-    mask_blue = cv2.morphologyEx(mask_blue, cv2.MORPH_OPEN, kernel)
-    mask_red = cv2.morphologyEx(mask_red, cv2.MORPH_OPEN, kernel)
-    # detect contours centers
-    def centers_from_mask(mask):
-        cnts,_ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        centers=[]
+    mask_r = cv2.morphologyEx(mask_r, cv2.MORPH_OPEN, kernel, iterations=1)
+    mask_b = cv2.morphologyEx(mask_b, cv2.MORPH_OPEN, kernel, iterations=1)
+
+    # 找到连通域
+    centers = []
+    for mask, col in [(mask_r, 'B'), (mask_b, 'P')]:
+        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         for c in cnts:
             area = cv2.contourArea(c)
-            if area < 8: continue
-            (x,y),r = cv2.minEnclosingCircle(c)
-            centers.append((int(x),int(y), area))
-        return centers
-    blue = centers_from_mask(mask_blue)
-    red = centers_from_mask(mask_red)
-    return {'blue': blue, 'red': red, 'mask_sample': None}
+            if area < 8:   # 过滤过小
+                continue
+            M = cv2.moments(c)
+            if M['m00'] == 0: continue
+            cx = int(M['m10']/M['m00']); cy = int(M['m01']/M['m00'])
+            centers.append((cx, cy, col))
+    return centers
 
-def analyze_table_grid(img_table):
+def cluster_regions(centers, img_w, img_h):
     """
-    对单桌进行简单的“连”统计：
-    - 我们把每一列上从上至下的圆点按 x 聚合，找到列序列后在列上统计连续颜色 run。
-    返回统计结果字典：max_run, count_long_runs(>=4), count_dragon(>=8), count_super(>=10), single_jump_runs, blank_ratio
+    将点聚成若干大区域 (boards)。策略：把点划到网格 cell 中，找高密度 cell，
+    合并相邻 cell 得到 bounding boxes。
+    返回 boxes: list of (x,y,w,h)
     """
-    h,w = img_table.shape[:2]
-    det = detect_color_circles(img_table)
-    pts = []
-    for (x,y,area) in det['blue']:
-        pts.append((x,y,'P'))  # P for Player (blue)
-    for (x,y,area) in det['red']:
-        pts.append((x,y,'B'))  # B for Banker (red)
-    if not pts:
-        return {'max_run':0,'count_long_runs':0,'count_dragon':0,'count_super':0,'single_jump_runs':0,'blank_ratio':1.0,'raw_pts':[]}
-    # cluster by x into columns
-    xs = sorted(set([p[0] for p in pts]))
-    # cluster close xs
-    cols = []
-    tol = max(8, w//100)  # tolerance
+    if len(centers) == 0:
+        return []
+    cell = max(40, img_w // 12)  # 调整
+    cols = math.ceil(img_w / cell); rows = math.ceil(img_h / cell)
+    grid = [[0]*cols for _ in range(rows)]
+    for (x,y,c) in centers:
+        cx = min(cols-1, int(x/cell)); ry = min(rows-1, int(y/cell))
+        grid[ry][cx] += 1
+    thr = 3  # cell 内点数量阈值
+    hits = []
+    for r in range(rows):
+        for c in range(cols):
+            if grid[r][c] >= thr:
+                hits.append((r,c))
+    # 合并邻近 cell
+    boxes = []
+    for (r,c) in hits:
+        x = c*cell; y = r*cell; w = cell; h = cell
+        merged=False
+        for b in boxes:
+            bx,by,bw,bh = b
+            if not (x > bx+bw+cell or x+w < bx-cell or y > by+bh+cell or y+h < by-cell):
+                # expand
+                nbx = min(bx, x); nby = min(by,y)
+                nbw = max(bx+bw, x+w) - nbx; nbh = max(by+bh, y+h) - nby
+                b[0]=nbx; b[1]=nby; b[2]=nbw; b[3]=nbh
+                merged=True; break
+        if not merged:
+            boxes.append([x,y,w,h])
+    # clip to image
+    boxes = [ (max(0,int(x)), max(0,int(y)), min(img_w,int(w)), min(img_h,int(h))) for x,y,w,h in boxes ]
+    return boxes
+
+def analyze_board_subimage(cv_sub):
+    """对于单个 board subimage，检测点中心并输出 flattened sequence & runs"""
+    centers = get_red_blue_centers(cv_sub)
+    if not centers:
+        return {"total":0,"flattened":[],"runs":[]}
+    # cluster by x (columns)
+    xs = [c[0] for c in centers]
     xs_sorted = sorted(xs)
-    groups = []
-    cur=[xs_sorted[0]]
-    for v in xs_sorted[1:]:
-        if abs(v - cur[-1]) <= tol:
-            cur.append(v)
+    # 做简单分组：当 x 间距 <= col_gap 则属于同列
+    col_gap = max(8, cv_sub.shape[1]//30)
+    cols = []
+    current = [xs_sorted[0]]
+    for i in range(1,len(xs_sorted)):
+        if xs_sorted[i] - xs_sorted[i-1] <= col_gap:
+            current.append(xs_sorted[i])
         else:
-            groups.append(cur)
-            cur=[v]
-    groups.append(cur)
-    col_centers = [int(sum(g)/len(g)) for g in groups]
-    # build columns: for each center, collect points near that x
-    col_points = []
-    for cx in col_centers:
-        col = [p for p in pts if abs(p[0]-cx) <= tol]
-        # sort by y (top->down) and map to sequence of 'P'/'B'
-        col_sorted = sorted(col, key=lambda x:x[1])
-        seq = [c for (_,_,c) in col_sorted]
-        col_points.append(seq)
-    # Now convert columns into a single timeline by reading columns left-to-right,
-    # for each column take topmost marker as the next "粒" in big road.
-    timeline = []
-    for seq in col_points:
-        if seq:
-            timeline.append(seq[0])  # top-most symbol
-    # compute runs:
-    max_run=0
-    curr = None
-    curr_count=0
-    single_jump_runs = 0
-    count_long_runs = 0
-    count_dragon = 0
-    count_super = 0
-    for s in timeline:
-        if curr is None or s != curr:
-            # close last
-            if curr_count>0:
-                if curr_count==1:
-                    single_jump_runs += 1
-                if curr_count>=4:
-                    count_long_runs += 1
-                if curr_count>=8:
-                    count_dragon += 1
-                if curr_count>=10:
-                    count_super += 1
-            curr = s
-            curr_count = 1
+            cols.append(current); current=[xs_sorted[i]]
+    cols.append(current)
+    # 但我们需要每个点的实际 color和y座标 -> 用 centers 中 nearest x to cluster
+    col_centers = []
+    for col in cols:
+        mean_x = sum(col)/len(col)
+        items = [c for c in centers if abs(c[0]-mean_x) <= col_gap+1]
+        # sort items by y top->bottom
+        items_sorted = sorted(items, key=lambda it: it[1])
+        col_centers.append(items_sorted)
+    # flattened by row: for row in rows: for col in cols: take col[row] if exists
+    max_rows = max((len(c) for c in col_centers), default=0)
+    flattened = []
+    for row in range(max_rows):
+        for c in col_centers:
+            if row < len(c):
+                flattened.append(c[row][2])  # color letter
+    # compute runs
+    runs=[]
+    if flattened:
+        cur = {"color":flattened[0], "len":1}
+        for i in range(1,len(flattened)):
+            if flattened[i] == cur["color"]:
+                cur["len"] += 1
+            else:
+                runs.append(cur)
+                cur = {"color":flattened[i], "len":1}
+        runs.append(cur)
+    return {"total":len(flattened), "flattened":flattened, "runs":runs}
+
+# 判定整体局势
+def decide_overall(board_stats):
+    longCount = 0
+    superCount = 0
+    longishCount = 0
+    sparse_count = 0
+    for b in board_stats:
+        runs = b["runs"]
+        maxRun = max((r["len"] for r in runs), default=0)
+        if maxRun >= 10:
+            superCount += 1
+        if maxRun >= 8:
+            longCount += 1
+        elif maxRun >= 4:
+            longishCount += 1
+        if b["total"] < 6:
+            sparse_count += 1
+    nboards = max(1, len(board_stats))
+    if longCount >= MIN_BOARDS_FOR_PUTTING:
+        overall = "放水时段（提高胜率）"
+    elif longCount >= MID_LONG_REQ and longishCount > 0:
+        overall = "中等胜率（中上）"
+    else:
+        if sparse_count >= nboards * 0.6:
+            overall = "胜率调低 / 收割时段"
         else:
-            curr_count += 1
-        if curr_count > max_run:
-            max_run = curr_count
-    # close tail
-    if curr_count>0:
-        if curr_count==1:
-            single_jump_runs += 1
-        if curr_count>=4:
-            count_long_runs += 1
-        if curr_count>=8:
-            count_dragon += 1
-        if curr_count>=10:
-            count_super += 1
-    # blank_ratio: approximate by no. of points vs expected grid size
-    approx_occupancy = len(timeline) / max(1, (w//20))  # heuristic
-    blank_ratio = 1.0 - min(1.0, approx_occupancy)
-    return {
-        'max_run': max_run,
-        'count_long_runs': count_long_runs,
-        'count_dragon': count_dragon,
-        'count_super': count_super,
-        'single_jump_runs': single_jump_runs,
-        'blank_ratio': blank_ratio,
-        'raw_pts': pts,
-        'timeline': timeline
-    }
+            overall = "胜率中等（平台收割中等时段）"
+    return overall, longCount, superCount
 
-# ---------- classify scene ----------
-def classify_scene(tables_stats):
-    total = len(tables_stats)
-    tables_with_dragon = sum(1 for t in tables_stats if t['count_dragon']>0 or t['count_super']>0)
-    tables_with_super = sum(1 for t in tables_stats if t['count_super']>0)
-    tables_dense_long = sum(1 for t in tables_stats if t['blank_ratio']<0.4 and t['count_long_runs']>=2)
-    # 放水子类A（满盘长连）
-    if tables_dense_long >= max(3, total//4):  # 至少 3 或許多
-        return "放水(强提醒)"
-    # 放水子类B（超长龙触发）
-    if tables_with_super >=1 and (tables_with_dragon >=2) and (tables_with_super + tables_with_dragon)>=3:
-        return "放水(强提醒)"
-    # 中等胜率（中上）
-    if tables_with_dragon >=2:
-        # 再确认是否有多连/连珠 via count_long_runs sum
-        if sum(t['count_long_runs'] for t in tables_stats) >= 3:
-            return "中等胜率(小提醒)"
-    # 假信号过滤
-    if tables_with_dragon < 2:
-        # platform may be lowering winrate
-        return "不提醒(假信号/收割)"
-    # default
-    return "不提醒(默认)"
-
-# ---------- persistence helpers ----------
-def load_state():
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE,"r",encoding="utf-8") as f:
-                return json.load(f)
-        except:
-            return {}
-    return {}
-
-def save_state(state):
-    with open(STATE_FILE,"w",encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
-
-def git_commit_and_push(commit_message="update state"):
-    """
-    用 GITHUB_TOKEN 的凭证把 state.json 提交回 repo（Actions runner 有 GITHUB_TOKEN）
-    workflow 必须 checkout 并保留凭证
-    """
-    try:
-        subprocess.run(["git","config","user.email","actions@github.com"], check=True)
-        subprocess.run(["git","config","user.name","github-actions"], check=True)
-        subprocess.run(["git","add",STATE_FILE], check=True)
-        subprocess.run(["git","commit","-m", commit_message], check=True)
-        # push uses existing origin with token (checkout persisted credentials)
-        subprocess.run(["git","push","origin","HEAD"], check=True)
-    except Exception as e:
-        print("git push failed:", e)
-
-# ---------- main routine ----------
-def main():
-    from playwright.sync_api import sync_playwright
-    state = load_state()
-    # ensure state keys
-    if 'alert' not in state:
-        state['alert'] = None  # one of None / "放水(强提醒)" / "中等胜率(小提醒)"
-    if 'alert_start' not in state:
-        state['alert_start'] = None
-    # start browser and navigate
+# ------------ 主流程 ------------
+def run_once():
+    log("开始一次检测流程...")
+    # Playwright: open browser, try two urls
+    shot = None
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(viewport={"width":1280,"height":800})
-        page = context.new_page()
-        # try both links until one works
-        opened = False
-        for url in DG_LINKS:
+        browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+        page = browser.new_page(viewport={"width":1366, "height":768})
+        ok = False
+        for url in DG_URLS:
             try:
-                page.goto(url, timeout=45000)
-                opened = True
+                log("尝试访问: " + url)
+                page.goto(url, timeout=30000)
+                time.sleep(2)
+                # 尝试点击 "Free" / "免费试玩" 文本
+                try:
+                    for t in ["Free", "免费试玩", "免费", "START", "试玩"]:
+                        btns = page.locator(f'text="{t}"')
+                        if btns.count() > 0:
+                            try:
+                                btns.first.click(timeout=3000)
+                                log(f"点击文字: {t}")
+                                time.sleep(1.5)
+                                break
+                            except:
+                                pass
+                except Exception as e:
+                    pass
+                # 如果出现一个滑动安全条（常见的 JS 验证），尝试找到滑块并拖动
+                try:
+                    # 尝试常见滑块元素选择器
+                    slider = None
+                    selectors = [
+                        'div[class*="slider"]', 'input[type="range"]', 'div[id*="slider"]',
+                        'div[class*="verification"]', 'div[class*="drag"]'
+                    ]
+                    for s in selectors:
+                        if page.query_selector(s):
+                            slider = page.query_selector(s)
+                            break
+                    if slider:
+                        box = slider.bounding_box()
+                        if box:
+                            sx = box["x"] + 5; sy = box["y"] + box["height"]/2
+                            tx = sx + box["width"] - 10
+                            page.mouse.move(sx, sy)
+                            page.mouse.down()
+                            page.mouse.move(tx, sy, steps=15)
+                            page.mouse.up()
+                            log("尝试模拟滑块拖动")
+                            time.sleep(2)
+                except Exception as e:
+                    log("滑块模拟异常: " + str(e))
+                # 等待可能的牌桌区域加载; 以某些已知页面元素做等待
+                try:
+                    page.wait_for_timeout(2500)
+                except:
+                    pass
+                # 最后截个全页面图
+                shot = page.screenshot(full_page=True)
+                ok = True
                 break
             except Exception as e:
-                print("open fail", url, e)
-        if not opened:
-            print("Cannot open DG links.")
-            return
-        time.sleep(2)
-        # try click "Free" or "免费试玩"
-        try:
-            selectors = ["text=Free", "text=免费试玩", "text=免费", "button:has-text(\"Free\")"]
-            clicked=False
-            for sel in selectors:
-                try:
-                    el = page.query_selector(sel)
-                    if el:
-                        el.click(timeout=5000)
-                        clicked=True
-                        break
-                except:
-                    pass
-            # if not clickable, try clicking at common coordinates
-            if not clicked:
-                # attempt to click roughly middle area to trigger free demo popup
-                page.mouse.click(1200,300)
-            time.sleep(3)
-            # now try to find slider; simulate drag if found
-            # common slider class detection attempts (this must be tuned if site changes)
-            slider_selectors = ["#slider", ".slider", ".verify-slider", "div[aria-label*='slider']"]
-            sl_found=False
-            for s in slider_selectors:
-                try:
-                    ss = page.query_selector(s)
-                    if ss:
-                        box = ss.bounding_box()
-                        if box:
-                            x = box['x'] + 5
-                            y = box['y'] + box['height']/2
-                            page.mouse.move(x,y)
-                            page.mouse.down()
-                            page.mouse.move(x+box['width']*0.9, y, steps=30)
-                            page.mouse.up()
-                            sl_found=True
-                            time.sleep(2)
-                            break
-                except:
-                    continue
-            # fallback: try dragging by fixed coordinate heuristic
-            if not sl_found:
-                try:
-                    # try a common slider location
-                    page.mouse.move(400, 500)
-                    page.mouse.down()
-                    page.mouse.move(1000, 500, steps=30)
-                    page.mouse.up()
-                    time.sleep(2)
-                except:
-                    pass
-        except Exception as e:
-            print("click free/slider fail:", e)
-        # wait a bit for lobby to load
-        time.sleep(6)
-        # take screenshot
-        shot = os.path.join(OUT_DIR, f"snap_{int(time.time())}.png")
-        try:
-            page.screenshot(path=shot, full_page=True)
-        except Exception as e:
-            print("screenshot fail:", e)
-            page.screenshot(path=shot, full_page=False)
-        # analyze screenshot
-        img = cv2.imread(shot)
-        h,w = img.shape[:2]
-        print("screenshot size", w, h)
-        table_stats = []
-        if TABLE_BOXES and len(TABLE_BOXES)>0:
-            # use calibrated boxes
-            for i,box in enumerate(TABLE_BOXES):
-                x,y,ww,hh = box
-                x2 = min(w, x+ww)
-                y2 = min(h, y+hh)
-                crop = img[y:y2, x:x2]
-                stats = analyze_table_grid(crop)
-                stats['box'] = box
-                table_stats.append(stats)
-        else:
-            # attempt auto-split: try a default grid split (4 columns x 4 rows)
-            cols = 4
-            rows = max(1, (h//200))  # heuristic
-            c_w = w//cols
-            r_h = h//rows
-            for ry in range(rows):
-                for cx in range(cols):
-                    x = cx*c_w
-                    y = ry*r_h
-                    crop = img[y:y+r_h, x:x+c_w]
-                    stats = analyze_table_grid(crop)
-                    stats['box'] = [x,y,c_w,r_h]
-                    table_stats.append(stats)
-        # classify
-        scene = classify_scene(table_stats)
-        print("scene:", scene)
-        # alert/persistence logic:
-        prev_alert = state.get('alert')
-        alert_start = state.get('alert_start')
-        now_ts = int(time.time())
-        if scene in ["放水(强提醒)","中等胜率(小提醒)"]:
-            if prev_alert != scene:
-                # new alert started
-                state['alert'] = scene
-                state['alert_start'] = now_ts
-                save_state(state)
-                try:
-                    git_commit_and_push(f"alert start {scene} at {now_str()}")
-                except:
-                    pass
-                # send telegram message (start)
-                msg = f"🔥 <b>{scene}</b> 被偵測到！\n開始時間： {now_str()}\n估計結束時間：等待系統偵測中（會於結束時通知）\n說明：符合你的放水/中等勝率判定。\n來源：{DG_LINKS[0]}"
-                send_telegram(msg)
-            else:
-                # already in alert; do nothing
-                print("alert already active:", prev_alert)
-        else:
-            # scene is not alert
-            if prev_alert is not None:
-                # previously alert ended — compute duration and notify
-                start = int(alert_start) if alert_start else now_ts
-                duration_min = (now_ts - start)/60.0
-                duration_min = round(duration_min,1)
-                msg = f"✅ <b>放水已結束</b>\n類型：{prev_alert}\n開始：{datetime.fromtimestamp(start, timezone(timedelta(hours=8))).strftime('%Y-%m-%d %H:%M:%S')}\n結束：{now_str()}\n共持續：{duration_min} 分鐘"
-                send_telegram(msg)
-                # clear state
-                state['alert'] = None
-                state['alert_start'] = None
-                save_state(state)
-                try:
-                    git_commit_and_push(f"alert end {prev_alert} at {now_str()} dur {duration_min}m")
-                except:
-                    pass
-            else:
-                print("no active alert and nothing to do")
-        # cleanup
+                log("访问或点击失败: " + str(e))
+                continue
         browser.close()
+    if not shot:
+        log("未能获得页面截图，结束本次检测。")
+        return None
+
+    # 读取图像
+    img_pil = Image.open(io.BytesIO(shot)).convert("RGB")
+    cv_img = pil_to_cv(img_pil)
+    h,w = cv_img.shape[:2]
+    # 检测点中心
+    centers = get_red_blue_centers(cv_img)
+    if not centers:
+        log("未检测到红/蓝点，可能页面未正确进入/截图与界面不匹配。")
+    boxes = cluster_regions(centers, w, h)
+    if not boxes:
+        # 如果 cluster 失败，使用全图分割成若干列作为 fallback
+        boxes = [ (0,0,w,h) ]
+    board_stats = []
+    for (x,y,ww,hh) in boxes:
+        sub = cv_img[y:y+hh, x:x+ww]
+        st = analyze_board_subimage(sub)
+        board_stats.append(st)
+    overall, longCount, superCount = decide_overall(board_stats)
+    # log some summary
+    log(f"检测结果：{overall}  (长/超长龙数: {longCount}, 超长龙数: {superCount}, 检测桌数: {len(board_stats)})")
+    return {
+        "overall": overall,
+        "longCount": longCount,
+        "superCount": superCount,
+        "nboards": len(board_stats),
+        "boards": board_stats
+    }
+
+# ---------- 主执行且处理 state 与提醒 ----------
+def main():
+    global TG_TOKEN, TG_CHAT
+    # 允许从脚本内硬编码覆盖（慎用）
+    if not TG_TOKEN:
+        log("警告: TG_TOKEN 未配置，若要发送 Telegram ，请在 GitHub Secrets 设置 TG_TOKEN")
+    if not TG_CHAT:
+        log("警告: TG_CHAT 未配置，若要发送 Telegram ，请在 GitHub Secrets 设置 TG_CHAT")
+    state = read_state()
+    try:
+        res = run_once()
+        if res is None:
+            return
+        overall = res["overall"]
+        now_ts = int(time.time())
+        # 判断是否属于要提醒的两种时段
+        is_water_or_mid = (overall == "放水时段（提高胜率）" or overall == "中等胜率（中上）")
+        # 如果进入放水且之前未处于放水 -> 发送开始提醒并记录 start_ts
+        if is_water_or_mid and not state.get("in_water", False):
+            # 检查冷却 last_alert_ts
+            last_alert = state.get("last_alert_ts")
+            if last_alert and now_ts - last_alert < COOLDOWN_MINUTES*60:
+                log("仍在冷却期内，不重复发送放水开始提醒。")
+            else:
+                text = f"[DG提醒] 現在判定：{overall}\\n長/超长龙={res['longCount']}, 超长龙={res['superCount']}, 檢測桌={res['nboards']}\\n時間：{datetime.now().astimezone().isoformat()}"
+                ok, ret = send_telegram(text)
+                if ok:
+                    state["in_water"] = True
+                    state["start_ts"] = now_ts
+                    state["last_alert_ts"] = now_ts
+                    write_state(state)
+                    commit_state_back()
+        # 如果当前非放水，但 state 表示之前处于放水 -> 发送放水结束并计算持续时间
+        elif (not is_water_or_mid) and state.get("in_water", False):
+            start_ts = state.get("start_ts")
+            if start_ts:
+                duration_min = int((now_ts - start_ts)/60)
+                start_str = datetime.fromtimestamp(start_ts, tz=timezone.utc).astimezone().isoformat()
+                text = f"[DG提醒] 放水結束。\\n開始時間：{start_str}\\n結束時間：{datetime.now().astimezone().isoformat()}\\n共持續約 {duration_min} 分鐘。"
+            else:
+                text = f"[DG提醒] 放水結束 (時長不明)。"
+            send_telegram(text)
+            # 清除状态
+            state["in_water"] = False
+            state["start_ts"] = None
+            state["last_alert_ts"] = int(time.time())
+            write_state(state)
+            commit_state_back()
+        else:
+            log("当前状态与历史状态一致，或不需要动作。")
+    except Exception as e:
+        log("主流程异常: " + str(e))
+        log(traceback.format_exc())
 
 if __name__ == "__main__":
     main()
