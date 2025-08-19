@@ -1,0 +1,40 @@
+name: DG Monitor
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'   # 每5分钟触发一次
+  workflow_dispatch: {}
+
+permissions:
+  contents: write  # 允许 workflow 提交 state.json 回 repo
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install playwright==1.43.0 requests numpy opencv-python-headless pillow
+          python -m playwright install --with-deps chromium
+
+      - name: Run DG monitor
+        env:
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}    # 推荐把 Telegram token 放到 GitHub Secrets
+          TG_CHAT:  ${{ secrets.TG_CHAT }}     # 推荐把 Chat ID 放到 GitHub Secrets
+          DG_URL_1: "https://dg18.co/wap/"
+          DG_URL_2: "https://dg18.co/"
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # 如果你要直接内嵌 token/chat（不推荐），可在仓库直接写到 secrets 或改成直接数值（自行承担风险）
+        run: |
+          python monitor.py
