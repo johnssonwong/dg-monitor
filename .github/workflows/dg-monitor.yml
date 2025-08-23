@@ -55,11 +55,14 @@ jobs:
         env:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT:  ${{ secrets.TG_CHAT }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}      # <-- 新增：确保脚本可写回 state.json
+          # keep DG links, thresholds as before
           DG_URL1:  "https://dg18.co/wap/"
           DG_URL2:  "https://dg18.co/"
           MIN_BOARDS_FOR_POW: "3"
           MID_LONG_REQ: "2"
           COOLDOWN_MINUTES: "10"
           MIN_BLOB_SIZE: "6"
+          CAPTURE_SAMPLES: "5"
         run: |
           python main.py
