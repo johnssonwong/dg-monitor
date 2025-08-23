@@ -349,28 +349,33 @@ def decide_overall(aggregated):
     if not aggregated or "summary" not in aggregated:
         return "no_data", aggregated
     s = aggregated["summary"]
-    long_count = int(s.get("long_count",0))
-    super_long = int(s.get("super_long_count",0))
-    longish = int(s.get("longish_count",0))
-    clusters = int(s.get("board_clusters",0))
-    # fake-signal rule
-    if long_count < 2:
-        # determine sparse vs medium
-        sparse = sum(1 for b in aggregated.get("boards",[]) if b.get("count",0) < 6)
-        if clusters > 0 and sparse >= clusters*0.6:
+    long_count = int(s.get("long_count", 0))
+    super_long = int(s.get("super_long_count", 0))
+    longish = int(s.get("longish_count", 0))
+    clusters = int(s.get("board_clusters", 0))
+    total_blobs = int(s.get("total_blobs", 0))
+
+    # 假信号规则：把 longish（>=4）也算作弱支持；如果 long+longish < 2 则视为假信号不提醒
+    if (long_count + longish) < 2:
+        sparse = sum(1 for b in aggregated.get("boards", []) if b.get("count", 0) < 6)
+        if clusters > 0 and sparse >= clusters * 0.6:
             return "胜率调低（平台收割时段）", s
         else:
             return "胜率中等（平台收割中等时段）", s
-    # 放水判定
+
+    # 放水判定（严格）：必须有至少 MIN_BOARDS_FOR_POW 张长龙/超长龙
     if long_count >= MIN_BOARDS_FOR_POW:
         return "放水时段（提高胜率）", s
-    # 中等胜率（中上）
-    if long_count >= MID_LONG_REQ and longish > 0:
+
+    # 中等胜率（中上）：若已有 >= MID_LONG_REQ 张长龙，或（长龙 + 长连）总数达到 MID_LONG_REQ
+    if (long_count >= MID_LONG_REQ) or ((long_count + longish) >= MID_LONG_REQ):
         return "中等胜率（中上）", s
-    # else sparse check
-    sparse = sum(1 for b in aggregated.get("boards",[]) if b.get("count",0) < 6)
-    if clusters > 0 and sparse >= clusters*0.6:
+
+    # 否则判定为收割或中等（和之前一致）
+    sparse = sum(1 for b in aggregated.get("boards", []) if b.get("count", 0) < 6)
+    if clusters > 0 and sparse >= clusters * 0.6:
         return "胜率调低（平台收割时段）", s
+
     return "胜率中等（平台收割中等时段）", s
 
 # main run
