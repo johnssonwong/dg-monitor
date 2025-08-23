@@ -445,14 +445,14 @@ def run_once():
             est_end_dt = start_dt + timedelta(minutes=est_minutes)
             # build message (human-readable time format)
             text = (
-                f"💵📈[DG提醒] 发现放水/中上局势\n"
+                f"💵📈 [DG提醒] 发现放水/中上局势\n"
                 f"判定: {overall}\n"
                 f"长龙(>=8) 桌数: {int(summary.get('long_count',0))}\n"
                 f"超长龙(>=10): {int(summary.get('super_long_count',0))}\n"
                 f"检测时间: {format_dt(start_dt)}\n"
-                f"⚠️预计持续时长（估计）: {est_minutes} 分钟\n"
-                f"⚠️预计结束时间（估计）: {format_dt(est_end_dt)}\n"
-                f"⚠️局势预计：剩下 {est_minutes} 分鐘（基於歷史中位數估計）\n"
+                f"⚠️ 预计持续时长（估计）: {est_minutes} 分钟\n"
+                f"⚠️ 预计结束时间（估计）: {format_dt(est_end_dt)}\n"
+                f"⚠️ 局势预计：剩下 {est_minutes} 分鐘（基於歷史中位數估計）\n"
                 "說明: 按既定閾值觸發；此為估計值，結束時會重新回報真實持續時間。"
             )
             send_telegram(text)
