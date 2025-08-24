@@ -28,15 +28,28 @@ jobs:
           pip install -r requirements.txt
           python -m playwright install chromium
 
-      - name: Export secrets
+           - name: Export secrets
         run: |
           echo "TG_BOT_TOKEN=${{ secrets.TG_BOT_TOKEN }}" >> $GITHUB_ENV
           echo "TG_CHAT_ID=${{ secrets.TG_CHAT_ID }}" >> $GITHUB_ENV
-          echo "MIN_BOARDS_FOR_PAW=${{ secrets.MIN_BOARDS_FOR_PAW }}" >> $GITHUB_ENV || true
-          echo "MID_LONG_REQ=${{ secrets.MID_LONG_REQ }}" >> $GITHUB_ENV || true
-        env:
-          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          # 如果你想用 secrets 覆盖默认值，可以在仓库 Secrets 新增 MIN_BOARDS_FOR_PAW/MID_LONG_REQ;
+          # 若没有设置，就写入默认值 3 / 2
+          if [ -n "${{ secrets.MIN_BOARDS_FOR_PAW }}" ]; then
+            echo "MIN_BOARDS_FOR_PAW=${{ secrets.MIN_BOARDS_FOR_PAW }}" >> $GITHUB_ENV
+          else
+            echo "MIN_BOARDS_FOR_PAW=3" >> $GITHUB_ENV
+          fi
+          if [ -n "${{ secrets.MID_LONG_REQ }}" ]; then
+            echo "MID_LONG_REQ=${{ secrets.MID_LONG_REQ }}" >> $GITHUB_ENV
+          else
+            echo "MID_LONG_REQ=2" >> $GITHUB_ENV
+          fi
+          # 同理 COOLDOWN 可选
+          if [ -n "${{ secrets.COOLDOWN_MINUTES }}" ]; then
+            echo "COOLDOWN_MINUTES=${{ secrets.COOLDOWN_MINUTES }}" >> $GITHUB_ENV
+          else
+            echo "COOLDOWN_MINUTES=10" >> $GITHUB_ENV
+          fi
 
       - name: Run DG monitor
         run: |
