@@ -1,61 +1,42 @@
-name: DG Monitor (every 5m)
+name: DG Monitor (looped every 6 hours, inner 5-min loops)
+
 on:
   schedule:
-    - cron: '*/5 * * * *'
+    - cron: '0 */6 * * *'  # 每 6 小时触发一次，job 内循环做连续 5 分钟检测（这样更稳定）
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    concurrency:
-      group: dg-monitor
-      cancel-in-progress: true
+    timeout-minutes: 360   # 6 hours, job 内部循环 72 次（72*300s ≈ 6hrs）
     steps:
-      - name: Checkout
+      - name: Checkout repo
         uses: actions/checkout@v4
-
-      - name: Cache node modules
-        uses: actions/cache@v4
         with:
-          path: ~/.npm
-          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
-          restore-keys: |
-            ${{ runner.os }}-node-
+          fetch-depth: 0
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - name: Setup Python
+        uses: actions/setup-python@v4
         with:
-          node-version: 18
+          python-version: '3.11'
 
-      - name: Install dependencies (ci || install)
+      - name: Install dependencies & browsers
         run: |
-          set -e
-          if npm ci --prefer-offline --no-audit --no-fund; then
-            echo "npm ci succeeded"
-          else
-            echo "npm ci failed; falling back to npm install"
-            npm install --no-audit --no-fund
-          fi
+          python -m pip install --upgrade pip
+          pip install playwright==1.39.0 opencv-python-headless numpy pillow requests
+          playwright install chromium
 
-      - name: Run DG Monitor
+      - name: Run monitor (loop)
         env:
-          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-          DG_URL1: 'https://dg18.co/wap/'
-          DG_URL2: 'https://dg18.co/'
-          MIN_LONG_BOARDS: '3'
-          MID_LONG_REQ: '3'
-          MID_MULTI_BOARDS: '3'
-          COOLDOWN_MIN: '10'
-          DEBUG_TO_TG: 'false'   # 若需要把每次 run 的 debug 结果发到 TG，可改为 'true'
-          UPLOAD_DEBUG_ARTIFACT: 'false'  # 若需把截图上传为 artifact 调试，可改为 'true'
-        run: node index.js
-
-      - name: Upload debug artifact (only if produced)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: dg-screenshot
-          path: debug-screenshot-*.png
+          DG_BOT_TOKEN: "8134230045:AAH6C_H53R_J2RH98fGTqZFHsjkKALhsTh8"
+          DG_CHAT_ID: "485427847"
+          DG_URL1: "https://dg18.co/wap/"
+          DG_URL2: "https://dg18.co/"
+          TZ_OFFSET: "+08:00"
+          LOOP_ITER: "72"          # 72 iterations -> 72 * 5 minutes = 360 minutes (6 hours)
+          SLEEP_SECONDS: "300"     # 300s = 5 minutes
+        run: |
+          python scripts/monitor_dg_loop.py
