@@ -1,69 +1,37 @@
-name: DG Monitor (optimized)
-
+name: DG Monitor (every 5m)
 on:
   schedule:
-    - cron: "*/5 * * * *"
-  workflow_dispatch: {}
-
-concurrency:
-  group: dg-monitor
-  cancel-in-progress: true
-
-permissions:
-  contents: write
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
 
 jobs:
-  run-monitor:
+  monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-
+    concurrency:
+      group: dg-monitor
+      cancel-in-progress: true
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
-          python-version: '3.10'
+          node-version: 18
 
-      - name: Cache pip packages
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
+      - name: Install dependencies
+        run: npm ci
 
-      - name: Cache Playwright browsers
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/ms-playwright
-          key: ${{ runner.os }}-playwright-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-playwright-
-
-      - name: Install dependencies (fast)
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: Install Playwright browsers (fast if cached)
-        run: |
-          python -m playwright install chromium
-
-      - name: Run monitor
+      - name: Run DG Monitor
         env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TG_TOKEN: ${{ secrets.TG_TOKEN }}
-          TG_CHAT: ${{ secrets.TG_CHAT }}
-          DG_URL1: "https://dg18.co/wap/"
-          DG_URL2: "https://dg18.co/"
-          MIN_BOARDS_FOR_POW: "3"
-          MID_LONG_REQ: "2"
-          COOLDOWN_MINUTES: "10"
-          MIN_BLOB_SIZE: "6"
-          CAPTURE_SAMPLES: "5"
-          ESTIMATED_DEFAULT_MINUTES: "10"
-
-        run: |
-          python main.py
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          DG_URL1: 'https://dg18.co/wap/'
+          DG_URL2: 'https://dg18.co/'
+          MIN_LONG_BOARDS: '3'
+          MID_LONG_REQ: '3'
+          MID_MULTI_BOARDS: '3'
+          COOLDOWN_MIN: '10'
+        run: node index.js
