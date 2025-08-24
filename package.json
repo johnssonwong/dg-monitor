@@ -1,0 +1,17 @@
+{
+  "name": "dg-monitor",
+  "version": "1.1.0",
+  "description": "DG 放水监测器 - 改良版",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "node-fetch": "^2.6.7",
+    "jimp": "^0.16.1",
+    "puppeteer-extra": "^3.3.4",
+    "puppeteer-extra-plugin-stealth": "^2.11.1",
+    "puppeteer": "^20.9.0",
+    "@octokit/rest": "^20.0.2"
+  }
+}
