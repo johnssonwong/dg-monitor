@@ -1,0 +1,6 @@
+playwright==1.41.1
+opencv-python-headless==4.8.1.78
+numpy==1.26.4
+pillow==10.0.1
+requests==2.31.0
+scikit-learn==1.4.2
