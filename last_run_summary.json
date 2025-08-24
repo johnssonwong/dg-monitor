@@ -1,0 +1,40 @@
+{
+  "ts": "2025-08-25T03:58:13.710603+08:00",
+  "overall": "胜率调低 / 收割时段",
+  "long_count": 0,
+  "super_count": 0,
+  "multirow_count": 0,
+  "boards": [
+    {
+      "total": 5,
+      "maxRun": 2,
+      "category": "other",
+      "has_multirow": false,
+      "runs": [
+        {
+          "color": "B",
+          "len": 1
+        },
+        {
+          "color": "P",
+          "len": 2
+        },
+        {
+          "color": "B",
+          "len": 2
+        }
+      ],
+      "row_runs": [
+        2,
+        1
+      ],
+      "region": [
+        517,
+        0,
+        241,
+        91
+      ],
+      "idx": 1
+    }
+  ]
+}
