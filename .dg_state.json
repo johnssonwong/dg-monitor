@@ -1,12 +1,6 @@
 {
   "history": [
     {
-      "ts": 1756049510.672202,
-      "overall": "胜率中等",
-      "long_tables": 1,
-      "multi3_tables": 1
-    },
-    {
       "ts": 1756050085.44553,
       "overall": "胜率中等",
       "long_tables": 2,
@@ -68,6 +62,12 @@
     },
     {
       "ts": 1756057717.126946,
+      "overall": "胜率中等",
+      "long_tables": 2,
+      "multi3_tables": 1
+    },
+    {
+      "ts": 1756058191.245797,
       "overall": "胜率中等",
       "long_tables": 2,
       "multi3_tables": 1
