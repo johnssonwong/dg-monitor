@@ -33,11 +33,25 @@ DG_LINKS = ["https://dg18.co/wap/", "https://dg18.co/"]
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "").strip()
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "").strip()
 
-# thresholds (adjustable via env)
-MIN_BOARDS_FOR_PAW = int(os.environ.get("MIN_BOARDS_FOR_PAW", "3"))  # 放水至少 3 张长龙
-MID_LONG_REQ = int(os.environ.get("MID_LONG_REQ", "2"))            # 中等胜率需要 >=2 张长龙
-MIN_POINTS_DETECTED = int(os.environ.get("MIN_POINTS_DETECTED", "6"))
-COOLDOWN_MINUTES = int(os.environ.get("COOLDOWN_MINUTES", "10"))
+# --- 读取环境变量（稳健处理空字符串 / 非法值） ---
+def safe_int_env(name, default):
+    v = os.environ.get(name)
+    if v is None:
+        return default
+    # strip whitespace; if empty -> default
+    v_str = str(v).strip()
+    if v_str == "":
+        return default
+    try:
+        return int(v_str)
+    except Exception:
+        # 如果无法解析为 int，回退到默认，并记录
+        print(f"[{now_str()}] WARNING: env {name} value '{v}' is not integer, using default {default}", flush=True)
+        return default
+
+MIN_BOARDS_FOR_PAW = safe_int_env("MIN_BOARDS_FOR_PAW", 3)   # 放水至少 3 张长龙（默认3）
+MID_LONG_REQ = safe_int_env("MID_LONG_REQ", 2)              # 中等胜率长龙桌数（默认2）
+COOLDOWN_MINUTES = safe_int_env("COOLDOWN_MINUTES", 10)     # 冷却分钟（默认10）
 
 # image analysis params (tweakable)
 HSV_RED_LOW1 = np.array([0, 100, 90])
