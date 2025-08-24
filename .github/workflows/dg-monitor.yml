@@ -14,13 +14,28 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Cache node modules
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 18
 
-      - name: Install dependencies
-        run: npm ci
+      - name: Install dependencies (ci || install)
+        run: |
+          set -e
+          if npm ci --prefer-offline --no-audit --no-fund; then
+            echo "npm ci succeeded"
+          else
+            echo "npm ci failed; falling back to npm install"
+            npm install --no-audit --no-fund
+          fi
 
       - name: Run DG Monitor
         env:
@@ -34,4 +49,13 @@ jobs:
           MID_LONG_REQ: '3'
           MID_MULTI_BOARDS: '3'
           COOLDOWN_MIN: '10'
+          DEBUG_TO_TG: 'false'   # 若需要把每次 run 的 debug 结果发到 TG，可改为 'true'
+          UPLOAD_DEBUG_ARTIFACT: 'false'  # 若需把截图上传为 artifact 调试，可改为 'true'
         run: node index.js
+
+      - name: Upload debug artifact (only if produced)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dg-screenshot
+          path: debug-screenshot-*.png
