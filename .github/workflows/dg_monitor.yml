@@ -1,19 +1,31 @@
+name: dg-monitor
+
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
   schedule:
     - cron: '*/5 * * * *'  # every 5 minutes
+
 jobs:
   monitor:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v4
+      - name: Setup Python
+        uses: actions/setup-python@v4
         with:
           python-version: '3.10'
-      - run: python -m pip install -r requirements.txt
-      - run: python -m playwright install chromium
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install playwright==1.41.1 opencv-python-headless==4.8.1.78 numpy==1.26.4 pillow==10.0.1 requests==2.31.0 scikit-learn==1.2.2
+      - name: Install Playwright browsers
+        run: |
+          python -m playwright install chromium
       - name: Run monitor
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-        run: python main.py
+          MIN_BOARDS_FOR_PAW: 3
+          MID_LONG_REQ: 2
+        run: |
+          python main.py
