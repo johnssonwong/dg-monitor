@@ -1,48 +1,19 @@
-name: DG Monitor (every 5m)
-
 on:
+  workflow_dispatch: {}
   schedule:
-    - cron: '*/5 * * * *'
-  workflow_dispatch:
-
-permissions:
-  contents: write
-
+    - cron: '*/5 * * * *'  # every 5 minutes
 jobs:
   monitor:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          persist-credentials: true
-      - name: Setup Python
-        uses: actions/setup-python@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v4
         with:
           python-version: '3.10'
-      - name: Install deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          python -m playwright install chromium
-      - name: Export secrets
-        run: |
-          echo "TG_BOT_TOKEN=${{ secrets.TG_BOT_TOKEN }}" >> $GITHUB_ENV
-          echo "TG_CHAT_ID=${{ secrets.TG_CHAT_ID }}" >> $GITHUB_ENV
-          echo "MIN_BOARDS_FOR_PAW=3" >> $GITHUB_ENV
-          echo "MID_LONG_REQ=2" >> $GITHUB_ENV
-          echo "COOLDOWN_MINUTES=10" >> $GITHUB_ENV
+      - run: python -m pip install -r requirements.txt
+      - run: python -m playwright install chromium
       - name: Run monitor
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-        run: |
-          python main.py
-      - name: Commit state if changed
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add state.json last_run_summary.json || true
-          git diff --staged --quiet || (git commit -m "Update state" && git push)
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python main.py
