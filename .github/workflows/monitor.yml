@@ -1,14 +1,9 @@
-name: DG Monitor (5-min internal loop)
+name: DG Monitor (every 5 minutes)
 
 on:
   schedule:
-    - cron: '*/5 * * * *'   # 每5分钟触发一次（用于“接力”），真正每5分钟检测在脚本内循环完成
+    - cron: '*/5 * * * *'
   workflow_dispatch:
-
-# 确保始终只有1个运行中的任务，防止重叠、卡住
-concurrency:
-  group: dg-monitor
-  cancel-in-progress: true
 
 permissions:
   contents: write
@@ -16,42 +11,42 @@ permissions:
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 360   # 安全上限（与脚本内IN_LOOP_MINUTES相配）
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          persist-credentials: true
 
-      - name: Set env (auto-filled)
-        run: |
-          echo "TZ=Asia/Kuala_Lumpur" >> $GITHUB_ENV
-          echo "TG_BOT_TOKEN=${{ secrets.TG_BOT_TOKEN }}" >> $GITHUB_ENV
-          echo "TG_CHAT_ID=${{ secrets.TG_CHAT_ID }}" >> $GITHUB_ENV
-          # 也给默认值（若未设置 secrets，会使用下面内置默认）
-          echo "MIN_TABLES_LONG_FOR_POUR=3" >> $GITHUB_ENV
-          echo "IN_LOOP_MINUTES=350" >> $GITHUB_ENV
-          echo "DETECT_INTERVAL_SECONDS=300" >> $GITHUB_ENV
-          echo "SAFE_MAX_SLEEP_MIN=90" >> $GITHUB_ENV
-          echo "DEFAULT_EST_MIN_POUR=20" >> $GITHUB_ENV
-          echo "DEFAULT_EST_MIN_MIDUP=12" >> $GITHUB_ENV
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - name: Setup Python 3.10
+        uses: actions/setup-python@v4
         with:
           python-version: '3.10'
 
-      - name: Install deps
+      - name: Install dependencies & Playwright browsers
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           python -m playwright install chromium
 
-      - name: Run monitor loop (~6h internal; 5-min cadence)
+      - name: Set env from secrets
+        run: |
+          echo "TG_BOT_TOKEN=${{ secrets.TG_BOT_TOKEN }}" >> $GITHUB_ENV
+          echo "TG_CHAT_ID=${{ secrets.TG_CHAT_ID }}" >> $GITHUB_ENV
+          echo "MIN_BOARDS_FOR_PAW=${{ secrets.MIN_BOARDS_FOR_PAW }}" >> $GITHUB_ENV || true
+          echo "MID_LONG_REQ=${{ secrets.MID_LONG_REQ }}" >> $GITHUB_ENV || true
+          echo "MID_MULTI_ROW_REQ=${{ secrets.MID_MULTI_ROW_REQ }}" >> $GITHUB_ENV || true
+          echo "COOLDOWN_MINUTES=${{ secrets.COOLDOWN_MINUTES }}" >> $GITHUB_ENV || true
+
+      - name: Run monitor
+        id: run_monitor
         run: |
           python main.py
 
-      - name: Commit state (if changed)
+      - name: Commit state files if changed
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add state.json last_run_summary.json || true
-          git diff --staged --quiet || (git commit -m "Update state by action" && git push)
+          git diff --staged --quiet || (git commit -m "update state from action" && git push)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
