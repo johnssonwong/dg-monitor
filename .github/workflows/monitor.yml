@@ -39,6 +39,10 @@ jobs:
           echo "MIN_BOARDS_FOR_PAW=3" >> $GITHUB_ENV
           echo "MID_LONG_REQ=2" >> $GITHUB_ENV
           echo "COOLDOWN_MINUTES=10" >> $GITHUB_ENV
+          echo "MIN_POINTS_FOR_REAL_BOARD=40" >> $GITHUB_ENV
+          echo "MAX_WAIT_SECONDS=30" >> $GITHUB_ENV
+          echo "RETRY_ATTEMPTS=2" >> $GITHUB_ENV
+
 
       - name: Run monitor
         run: |
