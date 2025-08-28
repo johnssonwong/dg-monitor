@@ -1,40 +1,48 @@
 {
-  "ts": "2025-08-25T23:55:57.122909+08:00",
-  "overall": "胜率调低 / 收割时段",
-  "long_count": 0,
-  "super_count": 0,
-  "multirow_count": 0,
+  "ts": "2025-08-28 16:45:55",
+  "overall": "胜率中等（平台收割中等时段）",
+  "longCount": 0,
+  "superCount": 0,
   "boards": [
     {
-      "total": 5,
-      "maxRun": 2,
+      "total": 7,
+      "maxRun": 3,
       "category": "other",
-      "has_multirow": false,
+      "flattened": [
+        "B",
+        "B",
+        "B",
+        "P",
+        "B",
+        "B",
+        "P"
+      ],
       "runs": [
         {
           "color": "B",
-          "len": 1
+          "len": 3
         },
         {
           "color": "P",
-          "len": 2
+          "len": 1
         },
         {
           "color": "B",
           "len": 2
+        },
+        {
+          "color": "P",
+          "len": 1
         }
       ],
-      "row_runs": [
-        2,
-        1
-      ],
-      "region": [
-        517,
+      "long_runs_count": 0,
+      "region_idx": 1,
+      "region_box": [
         0,
-        241,
-        91
-      ],
-      "idx": 1
+        0,
+        1280,
+        800
+      ]
     }
   ]
 }
