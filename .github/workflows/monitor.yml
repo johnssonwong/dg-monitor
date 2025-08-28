@@ -8,6 +8,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: dg-monitor
+  cancel-in-progress: true
+
 jobs:
   monitor:
     runs-on: ubuntu-latest
@@ -28,25 +32,26 @@ jobs:
           pip install -r requirements.txt
           python -m playwright install chromium
 
-      - name: Export secrets
+      - name: Export secrets and params
         run: |
           echo "TG_BOT_TOKEN=${{ secrets.TG_BOT_TOKEN }}" >> $GITHUB_ENV
           echo "TG_CHAT_ID=${{ secrets.TG_CHAT_ID }}" >> $GITHUB_ENV
           echo "MIN_BOARDS_FOR_PAW=3" >> $GITHUB_ENV
           echo "MID_LONG_REQ=2" >> $GITHUB_ENV
-        env:
-          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          echo "COOLDOWN_MINUTES=10" >> $GITHUB_ENV
 
       - name: Run monitor
         run: |
           python main.py
 
-      - name: Commit state files if changed
+      - name: Commit state if changed
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add state.json last_run_summary.json || true
-          git diff --staged --quiet || (git commit -m "Update state by action" && git push)
+          if ! git diff --staged --quiet; then
+            git commit -m "update state $(date -u +%Y%m%d%H%M%S)" || true
+            git push || true
+          fi
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
