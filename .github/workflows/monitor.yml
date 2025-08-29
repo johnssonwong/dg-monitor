@@ -1,4 +1,4 @@
-name: DG Monitor (every 5 minutes)
+name: DG Monitor (5m)
 
 on:
   schedule:
@@ -22,20 +22,25 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Install deps & Playwright
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           python -m playwright install chromium
 
-      - name: Run monitor
+      - name: Set env from secrets
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          MIN_BOARDS_FOR_PAW: ${{ secrets.MIN_BOARDS_FOR_PAW || '3' }}
-          MID_LONG_REQ: ${{ secrets.MID_LONG_REQ || '2' }}
-          MID_MULTI_ROW_REQ: ${{ secrets.MID_MULTI_ROW_REQ || '3' }}
-          COOLDOWN_MINUTES: ${{ secrets.COOLDOWN_MINUTES || '10' }}
+        run: |
+          echo "TG_BOT_TOKEN=${TG_BOT_TOKEN}" >> $GITHUB_ENV
+          echo "TG_CHAT_ID=${TG_CHAT_ID}" >> $GITHUB_ENV
+          echo "MIN_BOARDS_FOR_PAW=3" >> $GITHUB_ENV
+          echo "MID_LONG_REQ=2" >> $GITHUB_ENV
+          echo "COOLDOWN_MINUTES=10" >> $GITHUB_ENV
+
+      - name: Run monitor
+        id: run
         run: |
           python main.py
 
@@ -43,7 +48,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add state.json last_run_summary.json historical_events.json || true
-          git diff --staged --quiet || (git commit -m "update state from action" && git push)
+          git add state.json last_run_summary.json || true
+          git diff --staged --quiet || (git commit -m "Update state by action" && git push)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
