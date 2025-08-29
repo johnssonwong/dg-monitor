@@ -1,18 +1,15 @@
 {
-  "ts": "2025-08-29 01:49:02",
-  "mode": "visual",
-  "info": null,
+  "ts": "2025-08-29 12:48:34",
+  "overall": "胜率中等（平台收割中等时段）",
+  "longCount": 0,
+  "superCount": 0,
   "boards": [
     {
-      "total": 10,
-      "maxRun": 4,
+      "total": 9,
+      "maxRun": 5,
       "category": "longish",
       "runs": [
         {
-          "color": "P",
-          "len": 2
-        },
-        {
           "color": "B",
           "len": 1
         },
@@ -22,7 +19,7 @@
         },
         {
           "color": "B",
-          "len": 4
+          "len": 5
         },
         {
           "color": "P",
@@ -33,22 +30,19 @@
           "len": 1
         }
       ],
-      "multiRuns": 1,
-      "cols_max": [
-        1,
-        1,
-        1,
-        1,
-        1,
-        1,
-        1,
-        1
+      "flattened": [
+        "B",
+        "P",
+        "B",
+        "B",
+        "B",
+        "B",
+        "B",
+        "P",
+        "B"
       ],
-      "consec3": false
+      "is_multi": false,
+      "multi_cols": 0
     }
-  ],
-  "points": 10,
-  "overall": "胜率中等（平台收割中等时段）",
-  "longCount": 0,
-  "superCount": 0
+  ]
 }
