@@ -1,10 +1,10 @@
-# main.py  — DG 实盘监测（增强：加入“格子/桌子（矩形）检测”）
-# 保持文件名 main.py（不要改）
+# main.py  — DG 实盘监测（增强：立即尝试次级替补格子检测）
+# 请保持文件名 main.py（不要改）
 # 环境变量:
 #   TG_BOT_TOKEN (必须)
 #   TG_CHAT_ID (必须)
 #   MIN_POINTS_FOR_REAL (默认 10)
-#   MIN_BOARDS_FOR_REAL (默认 8)  <-- 新增：检测页面上矩形桌子数以判断是否进入实盘
+#   MIN_BOARDS_FOR_REAL 或 MIN_BOARDS_FOR_PAW (默认 8)
 #   COOLDOWN_MINUTES (默认 10)
 #   HISTORY_LOOKBACK_DAYS (默认 28)
 
@@ -23,7 +23,8 @@ TG_TOKEN_ENV = "TG_BOT_TOKEN"
 TG_CHAT_ENV = "TG_CHAT_ID"
 
 MIN_POINTS_FOR_REAL = int(os.environ.get("MIN_POINTS_FOR_REAL", "10"))
-MIN_BOARDS_FOR_REAL = int(os.environ.get("MIN_BOARDS_FOR_REAL", "8"))  # 新增：桌子/格子数量阈值
+# 支持两种环境变量名（向后兼容）
+MIN_BOARDS_FOR_REAL = int(os.environ.get("MIN_BOARDS_FOR_REAL", os.environ.get("MIN_BOARDS_FOR_PAW", "8")))
 COOLDOWN_MINUTES = int(os.environ.get("COOLDOWN_MINUTES", "10"))
 HISTORY_LOOKBACK_DAYS = int(os.environ.get("HISTORY_LOOKBACK_DAYS", "28"))
 
@@ -96,16 +97,11 @@ def detect_color_points(bgr):
         pts.append((cx,cy))
     return pts
 
-# ---------- 新增：矩形格子（桌子）检测 ----------
+# ---------- 主格子检测（原） ----------
 def detect_rectangular_boards(bgr):
-    """
-    返回 detected_rects, boards_count
-    使用 Canny -> 膨胀 -> 轮廓 -> 多边形逼近 -> 4 边形筛选
-    """
     img = bgr.copy()
     h,w = img.shape[:2]
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    # 自适应缩放：对于很大的截图先缩放到宽度 <= 1280，加速处理
     scale = 1.0
     if w > 1400:
         scale = 1280.0 / w
@@ -126,19 +122,16 @@ def detect_rectangular_boards(bgr):
             ar = w_ / float(h_) if h_>0 else 0
             if h_ < 30 or w_ < 30: continue
             if ar < 0.3 or ar > 4.0: continue
-            # 排除非常大的背景矩形
             if w_ > gray.shape[1]*0.9 and h_ > gray.shape[0]*0.9: continue
-            # 恢复原始尺度
             if scale != 1.0:
                 x = int(x/scale); y = int(y/scale); w_ = int(w_/scale); h_ = int(h_/scale)
             rects.append((x,y,w_,h_))
-    # 去重/融合近邻矩形（若有重叠合并）
+    # 合并近邻
     merged = []
     for r in rects:
         rx,ry,rw,rh = r
         merged_flag=False
         for i,(mx,my,mw,mh) in enumerate(merged):
-            # overlap test
             if not (rx > mx+mw or mx > rx+rw or ry > my+mh or my > ry+rh):
                 nx = min(rx,mx); ny = min(ry,my)
                 nx2 = max(rx+rw, mx+mw); ny2 = max(ry+rh, my+mh)
@@ -147,11 +140,67 @@ def detect_rectangular_boards(bgr):
                 break
         if not merged_flag:
             merged.append(r)
-    # 返回 merged 及其数量
     boards_count = len(merged)
     return merged, boards_count
 
-# ---------- 先前的 board 分析（保留） ----------
+# ---------- 次级（替补）格子检测：更宽松 + 网格/线检测（新增） ----------
+def detect_rectangular_boards_secondary(bgr):
+    """
+    更宽松的替补检测：
+    - 使用自适应阈值 + 较小最小面积
+    - 同时尝试基于水平/垂直线的网格检测（morph close）
+    - 合并并去重后返回矩形和数量
+    """
+    img = bgr.copy()
+    h,w = img.shape[:2]
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    # 缩小加速
+    scale = 1.0
+    if w > 1600:
+        scale = 1280.0 / w
+        gray = cv2.resize(gray, (int(w*scale), int(h*scale)))
+    # 自适应阈值，增强线条
+    th = cv2.adaptiveThreshold(gray,255,cv2.ADAPTIVE_THRESH_GAUSSIAN_C,cv2.THRESH_BINARY_INV,11,6)
+    # 用形态学找横/竖线（网格）
+    horiz_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(9, int(gray.shape[1]//20)),1))
+    vert_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(9, int(gray.shape[0]//20))))
+    horiz = cv2.morphologyEx(th, cv2.MORPH_OPEN, horiz_kernel, iterations=1)
+    vert = cv2.morphologyEx(th, cv2.MORPH_OPEN, vert_kernel, iterations=1)
+    grid = cv2.add(horiz, vert)
+    # 膨胀以连通格子轮廓
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5,5))
+    grid = cv2.dilate(grid, kernel, iterations=2)
+    cnts, _ = cv2.findContours(grid, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    rects = []
+    for cnt in cnts:
+        area = cv2.contourArea(cnt)
+        if area < 200: continue   # 次级阈值更小
+        x,y,w_,h_ = cv2.boundingRect(cnt)
+        if w_ < 25 or h_ < 25: continue
+        ar = w_/float(h_) if h_>0 else 0
+        if ar < 0.25 or ar > 5.0: continue
+        # 恢复原始尺度
+        if scale != 1.0:
+            x = int(x/scale); y = int(y/scale); w_ = int(w_/scale); h_ = int(h_/scale)
+        rects.append((x,y,w_,h_))
+    # 再融合近邻
+    merged = []
+    for r in rects:
+        rx,ry,rw,rh = r
+        merged_flag=False
+        for i,(mx,my,mw,mh) in enumerate(merged):
+            if not (rx > mx+mw or mx > rx+rw or ry > my+mh or my > ry+rh):
+                nx = min(rx,mx); ny = min(ry,my)
+                nx2 = max(rx+rw, mx+mw); ny2 = max(ry+rh, my+mh)
+                merged[i] = (nx, ny, nx2-nx, ny2-ny)
+                merged_flag=True
+                break
+        if not merged_flag:
+            merged.append(r)
+    boards_count = len(merged)
+    return merged, boards_count
+
+# ---------- 之前的 board 分析（保留） ----------
 def analyze_board(bgr, rect):
     x,y,w,h = rect
     crop = bgr[y:y+h, x:x+w]
@@ -182,7 +231,7 @@ def classify_overall(board_infos):
         return "勝率調低 / 收割時段", sum(1 for b in board_infos if b['maxRun']>=8), sum(1 for b in board_infos if b['category']=='super_long')
     return "勝率中等（平台收割中等時段）", sum(1 for b in board_infos if b['maxRun']>=8), sum(1 for b in board_infos if b['category']=='super_long')
 
-# ---------- Playwright & 滑块（保留，略微增加等待） ----------
+# ---------- Playwright & 滑块（保留） ----------
 def apply_stealth(page):
     page.add_init_script("""
     Object.defineProperty(navigator, 'webdriver', {get: () => false});
@@ -277,10 +326,19 @@ def capture_dg_page(attempts=3):
                         pts = detect_color_points(bgr)
                         rects, boards_count = detect_rectangular_boards(bgr)
                         log(f"检查 {s+1}: 点数 {len(pts)}; 检测格子数 {boards_count}")
-                        # 若颜色点或格子数任一满足阈值, 直接返回截图
+                        # 首次判断：颜色点或主格子检测满足阈值
                         if len(pts) >= MIN_POINTS_FOR_REAL or boards_count >= MIN_BOARDS_FOR_REAL:
                             context.close(); browser.close()
                             return ss
+                        # 如果首次未满足，**立即**尝试次级替补检测（对同一张截图）
+                        sec_rects, sec_boards_count = detect_rectangular_boards_secondary(bgr)
+                        log(f"次级替補检测: 格子数 {sec_boards_count}")
+                        if sec_boards_count >= MIN_BOARDS_FOR_REAL:
+                            log("次級替補满足格子阈值 -> 视为进入实盘")
+                            # 优先返回原始截图（供后续处理）
+                            context.close(); browser.close()
+                            return ss
+                        # 否则继续尝试滑块/后续循环
                     # 否则尝试下一个 url
                 except PWTimeout as e:
                     log(f"页面打开超时: {e}")
@@ -294,7 +352,7 @@ def capture_dg_page(attempts=3):
         log("未能进入实盘（多次尝试失败或阈值未满足）")
         return None
 
-# ---------- 替补（Wayback 等） 保留，行为同前脚本（静默收集/仅在预测命中时通知） ----------
+# ---------- 替补（Wayback 等） 保留 ---------- 
 def get_wayback_snapshots(url, from_date=None, to_date=None, limit=40):
     base = "http://web.archive.org/cdx/search/cdx"
     params = {"url":url, "output":"json", "filter":"statuscode:200", "limit":str(limit)}
@@ -345,7 +403,13 @@ def fallback_with_history_and_maybe_alert(state):
             pts = detect_color_points(bgr)
             rects, boards_count = detect_rectangular_boards(bgr)
             if len(pts) < MIN_POINTS_FOR_REAL and boards_count < MIN_BOARDS_FOR_REAL:
-                continue
+                # 立即尝试次級替補
+                sec_rects, sec_boards_count = detect_rectangular_boards_secondary(bgr)
+                log(f"Wayback 次級替補检测: 格子数 {sec_boards_count}")
+                if sec_boards_count >= MIN_BOARDS_FOR_REAL:
+                    rects = sec_rects; boards_count = sec_boards_count
+                else:
+                    continue
             board_rects = rects if rects else []
             boards=[]
             for r in board_rects: boards.append(analyze_board(bgr, r))
@@ -360,7 +424,6 @@ def fallback_with_history_and_maybe_alert(state):
                 hist.append(rec); state["history"] = hist[-2000:]; collected += 1
     save_state(state)
     log(f"Wayback 替補收集结束，共收集 {collected} 条事件")
-    # 简单预测逻辑同前脚本（略）——只在预测命中当前时间窗口且为放水/中上才通知（保持不改）
 
 # ---------- 主逻辑 ----------
 def main():
@@ -378,6 +441,14 @@ def main():
         rects, boards_count = detect_rectangular_boards(bgr)
         log(f"实时检测点数: {len(pts)} (阈值 {MIN_POINTS_FOR_REAL}); 检测到格子数: {boards_count} (阈值 {MIN_BOARDS_FOR_REAL})")
         entered = (len(pts) >= MIN_POINTS_FOR_REAL) or (boards_count >= MIN_BOARDS_FOR_REAL)
+        # 如果主检测失败，这里再次尝试次级替补（以防 capture_dg_page 未返回因为次级触发）
+        if not entered:
+            sec_rects, sec_boards_count = detect_rectangular_boards_secondary(bgr)
+            log(f"实时次级替補检测: 格子数 {sec_boards_count} (阈值 {MIN_BOARDS_FOR_REAL})")
+            if sec_boards_count >= MIN_BOARDS_FOR_REAL:
+                log("次级替补满足 -> 视为进入实盘")
+                rects = sec_rects; boards_count = sec_boards_count
+                entered = True
         if not entered:
             log("未达到进入实盘的任一阈值 -> 静默替补历史收集/预测")
             fallback_with_history_and_maybe_alert(state)
@@ -387,9 +458,7 @@ def main():
         boards=[]
         for r in board_rects:
             boards.append(analyze_board(bgr, r))
-        # 如果没有 rects，但 color points 很多，则可以把整图分块近似为板
         if not boards:
-            # 快速做一个自动分块：把图等分成若干板以便分类
             h,w = bgr.shape[:2]
             cols = max(3, w//320)
             rows = max(2, h//200)
@@ -400,7 +469,6 @@ def main():
                     boards.append(analyze_board(bgr, rect))
         overall, longCount, superCount = classify_overall(boards)
         log(f"实时判定: {overall} (长龙/超: {longCount}/{superCount})")
-        # 只有当判定为放水或中等勝率（中上）时才发通知
         if overall in ("放水時段（提高勝率）","中等勝率（中上）"):
             last_alert = state.get("last_alert_time")
             if last_alert:
