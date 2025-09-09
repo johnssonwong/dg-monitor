@@ -1,0 +1,55 @@
+{
+  "ts": "2025-09-10T01:24:23.481151+08:00",
+  "overall": "胜率中等（平台收割中等时段）",
+  "longCount": 0,
+  "superCount": 0,
+  "multi_count": 0,
+  "boards": [
+    {
+      "total": 9,
+      "maxRun": 4,
+      "category": "longish",
+      "columns": [
+        1,
+        2,
+        1,
+        1,
+        1,
+        1
+      ],
+      "flattened": [
+        "B",
+        "P",
+        "B",
+        "B",
+        "B",
+        "B",
+        "P",
+        "P",
+        "B"
+      ],
+      "runs": [
+        {
+          "color": "B",
+          "len": 1
+        },
+        {
+          "color": "P",
+          "len": 1
+        },
+        {
+          "color": "B",
+          "len": 4
+        },
+        {
+          "color": "P",
+          "len": 2
+        },
+        {
+          "color": "B",
+          "len": 1
+        }
+      ]
+    }
+  ]
+}
