@@ -22,31 +22,30 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Install dependencies
+      - name: Install dependencies and Playwright
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           python -m playwright install chromium
 
-      - name: Export secrets to env
+      - name: Export env (token from secrets)
         run: |
           echo "TG_BOT_TOKEN=${{ secrets.TG_BOT_TOKEN }}" >> $GITHUB_ENV
           echo "TG_CHAT_ID=${{ secrets.TG_CHAT_ID }}" >> $GITHUB_ENV
           echo "MIN_BOARDS_FOR_PAW=3" >> $GITHUB_ENV
           echo "MID_LONG_REQ=2" >> $GITHUB_ENV
-        env:
-          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          echo "COOLDOWN_MINUTES=10" >> $GITHUB_ENV
+          echo "DEFAULT_ESTIMATE_MINUTES=10" >> $GITHUB_ENV
 
       - name: Run monitor
         run: |
           python main.py
 
       - name: Commit state if changed
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add state.json last_run_summary.json last_screenshot.png || true
-          git diff --staged --quiet || (git commit -m "Update state by action" && git push)
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          git add state.json last_run_summary.json || true
+          git diff --staged --quiet || (git commit -m "Update DG monitor state" && git push)
