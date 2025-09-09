@@ -1,398 +1,443 @@
-#!/usr/bin/env python3
-# main.py — 强化版（优先替补检测 + 历史判定直接触发 Telegram）
-# 保留文件名：state.json, history_db.json, history_stats.json, last_summary.json
-# 环境变量：TG_BOT_TOKEN, TG_CHAT_ID, MIN_BOARDS_FOR_PAW, HISTORY_LOOKBACK_DAYS, HISTORY_PROB_THRESHOLD
-
-import os, sys, json, logging, argparse
-from datetime import datetime, timedelta
+# -*- coding: utf-8 -*-
+"""
+DG 实盘监测脚本（用于 GitHub Actions）
+作者：为用户整合（基于用户在对话中所有规则）
+说明：
+ - 每次 run 会尝试访问 DG 两个入口（https://dg18.co/wap/, https://dg18.co/）
+ - 模拟点击 "Free/免费试玩"、模拟滚动安全条，截取页面
+ - 用 OpenCV 检测红/蓝“珠子”，并把点按列/行重建为 baccarat 珠盘序列
+ - 依据用户规则判断：放水时段 或 中等胜率（中上） => 发送 Telegram 提醒（一次启动通知 + 结束通知）
+ - 事件开始时会估算结束时间（基于历史平均），并在结束时发送真实持续时间
+ - 当事件 active 后，脚本会在 estimated_end_time 到来前**跳过频繁截图**以减少误判（GH Actions 仍每5分钟触发脚本，但脚本会按策略决定是否实际抓图）
+"""
+import os, sys, time, json, math, traceback
+from datetime import datetime, timedelta, timezone
+import requests, base64
+from io import BytesIO
 from pathlib import Path
-from typing import List, Tuple
-import cv2, numpy as np, requests
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
 
-# ------------- 配置 & 常量 -------------
-TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
-TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
-MIN_BOARDS_FOR_PAW = int(os.getenv("MIN_BOARDS_FOR_PAW", "3"))
-HISTORY_LOOKBACK_DAYS = int(os.getenv("HISTORY_LOOKBACK_DAYS", "28"))
-HISTORY_PROB_THRESHOLD = float(os.getenv("HISTORY_PROB_THRESHOLD", "0.35"))
-HISTORY_WINDOW_RUNS = int(os.getenv("HISTORY_WINDOW_RUNS", "50"))  # 最近 runs 个数用于历史判定
-DEFAULT_LOCAL_IMAGE = Path("/mnt/data/3D04749B-1CDC-42B0-8468-E233F3F81987.jpeg")
+# image & cv
+import numpy as np
+from PIL import Image
+import cv2
 
-STATE_PATH = Path("state.json")
-HISTORY_DB_PATH = Path("history_db.json")
-HISTORY_STATS_PATH = Path("history_stats.json")
-LAST_SUMMARY_PATH = Path("last_summary.json")
+# playwright
+from playwright.sync_api import sync_playwright
 
-# ------------- Logging -------------
-logger = logging.getLogger("dg-monitor")
-logger.setLevel(logging.INFO)
-ch = logging.StreamHandler(sys.stdout)
-ch.setFormatter(logging.Formatter("[%(asctime)s] %(message)s", "%Y-%m-%d %H:%M:%S"))
-logger.addHandler(ch)
+# sklearn for fallback clustering
+from sklearn.cluster import KMeans
 
-BoardRect = Tuple[int, int, int, int, float]
+# ---------- CONFIG (可在 Actions env/secrets 中覆盖) ----------
+TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "").strip()
+TG_CHAT_ID  = os.environ.get("TG_CHAT_ID", "").strip()
 
-# ------------- JSON helpers -------------
-def load_json_safe(p: Path, default):
-    try:
-        if p.exists():
-            with open(p, "r", encoding="utf-8") as f:
-                return json.load(f)
-    except Exception as e:
-        logger.warning(f"读取 {p} 失败: {e}")
-    return default
+DG_LINKS = [
+    "https://dg18.co/wap/",
+    "https://dg18.co/"
+]
 
-def save_json_safe(p: Path, data):
-    try:
-        with open(p, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        logger.warning(f"写入 {p} 失败: {e}")
+# 判定阈值（可根据实际微调）
+MIN_BOARDS_FOR_PAW = int(os.environ.get("MIN_BOARDS_FOR_PAW", "3"))  # 放水至少满足桌数
+MID_LONG_REQ = int(os.environ.get("MID_LONG_REQ", "2"))             # 中等胜率需要至少龙桌数量
+COOLDOWN_MINUTES = int(os.environ.get("COOLDOWN_MINUTES", "10"))    # 通用冷却
 
-def ensure_placeholders():
-    if not STATE_PATH.exists():
-        save_json_safe(STATE_PATH, {"created": True, "ts": datetime.now().isoformat()})
-    if not HISTORY_DB_PATH.exists():
-        save_json_safe(HISTORY_DB_PATH, {"runs": []})
-    if not HISTORY_STATS_PATH.exists():
-        save_json_safe(HISTORY_STATS_PATH, {"total_runs": 0, "total_boards": 0, "pumping_count": 0})
-    if not LAST_SUMMARY_PATH.exists():
-        save_json_safe(LAST_SUMMARY_PATH, {"ts": datetime.now().isoformat(), "summary": ""})
+# 文件与时区
+STATE_FILE = "state.json"
+LAST_SUMMARY = "last_run_summary.json"
+TZ = timezone(timedelta(hours=8))  # Malaysia UTC+08:00
 
-# ------------- Image detection helpers -------------
-def primary_detect_grid(img: np.ndarray, min_area: int = 20000) -> List[BoardRect]:
-    """主检测：寻找大矩形（保守）"""
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (5,5), 0)
-    th = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, 51, 9)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 9))
-    morph = cv2.morphologyEx(th, cv2.MORPH_CLOSE, kernel, iterations=2)
-    cnts, _ = cv2.findContours(morph, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    rects = []
-    for c in cnts:
-        area = cv2.contourArea(c)
-        if area < min_area:
-            continue
-        x,y,w,h = cv2.boundingRect(c)
-        if w < 80 or h < 50: continue
-        rects.append((x,y,w,h,float(area)))
-    rects.sort(key=lambda r:(r[1], r[0]))
-    return rects
+# 运行调试开关
+DEBUG_SAVE_IMAGE = False  # 若 True 会保存 last_screenshot.png 到仓库，便于离线调参（注意不要泄露）
 
-def fallback_detect_edges(img: np.ndarray, min_area: int = 2000) -> List[BoardRect]:
-    """替补检测：更激进，优先使用"""
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (3,3), 0)
-    edges = cv2.Canny(blurred, 40, 120)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5,5))
-    dil = cv2.dilate(edges, kernel, iterations=2)
-    cnts, _ = cv2.findContours(dil, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    rects = []
-    for c in cnts:
-        area = cv2.contourArea(c)
-        if area < min_area: continue
-        x,y,w,h = cv2.boundingRect(c)
-        if w < 40 or h < 40: continue
-        rects.append((x,y,w,h,float(area)))
-    rects.sort(key=lambda r:(r[1], r[0]))
-    return rects
+# ---------- helper ----------
+def log(msg):
+    now = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{now}] {msg}", flush=True)
 
-def aggressive_multi_pass_detect(img: np.ndarray) -> Tuple[List[BoardRect], str]:
-    """多参数多通道尝试：优先使用替补检测（你要求的替补优先），若替补未达到期望再尝试主检测和调整参数。"""
-    # 1) 替补（首选）
-    fb = fallback_detect_edges(img)
-    if len(fb) >= MIN_BOARDS_FOR_PAW:
-        return fb, "fallback_primary"
-    # 2) 主检测（保守）
-    prim = primary_detect_grid(img)
-    # 3) 替补+主的合并（避免漏判）
-    combined = sorted(fb + prim, key=lambda r:(r[1], r[0]))
-    # 去重（合并重叠）
-    final = []
-    for r in combined:
-        x,y,w,h,a = r
-        overlap = False
-        for fr in final:
-            fx,fy,fw,fh,fa = fr
-            if (x < fx+fw and fx < x+w and y < fy+fh and fy < y+h):
-                overlap = True
-                break
-        if not overlap:
-            final.append(r)
-    if len(final) >= MIN_BOARDS_FOR_PAW:
-        return final, "fallback_then_primary_combined"
-    # 4) 如果都不够，尝试放宽主检测参数（更激进）
-    prim2 = primary_detect_grid(img, min_area=8000)
-    if len(prim2) >= MIN_BOARDS_FOR_PAW:
-        return prim2, "primary_relaxed"
-    # 5) 最后返回目前检测到的（可能为 0）
-    if len(fb) >= len(prim):
-        return fb, "fallback_best"
-    return prim, "primary_best"
-
-# ------------- Color ratio & pumping detection -------------
-def board_red_blue_ratio(crop: np.ndarray):
-    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-    # 红色范围（两段）
-    lower_r1 = np.array([0, 70, 30]); upper_r1 = np.array([10, 255, 255])
-    lower_r2 = np.array([160,70,30]); upper_r2 = np.array([179,255,255])
-    mask_r = cv2.inRange(hsv, lower_r1, upper_r1) | cv2.inRange(hsv, lower_r2, upper_r2)
-    # 蓝色范围
-    lower_b = np.array([90,50,30]); upper_b = np.array([140,255,255])
-    mask_b = cv2.inRange(hsv, lower_b, upper_b)
-    # 平滑并计数
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3))
-    mask_r = cv2.morphologyEx(mask_r, cv2.MORPH_OPEN, kernel, iterations=1)
-    mask_b = cv2.morphologyEx(mask_b, cv2.MORPH_OPEN, kernel, iterations=1)
-    rc = int(cv2.countNonZero(mask_r))
-    bc = int(cv2.countNonZero(mask_b))
-    return rc, bc
-
-def detect_pumping_from_rects(img: np.ndarray, rects: List[BoardRect], prob_threshold: float = HISTORY_PROB_THRESHOLD):
-    per = []
-    tot_r = 0; tot_b = 0; valid_boards = 0
-    for i, (x,y,w,h,a) in enumerate(rects):
-        crop = img[y:y+h, x:x+w]
-        r,b = board_red_blue_ratio(crop)
-        if r + b < 40:
-            per.append({"idx": i+1, "red": r, "blue": b, "ratio": None, "valid": False})
-            continue
-        ratio = r / (r + b)
-        per.append({"idx": i+1, "red": r, "blue": b, "ratio": ratio, "valid": True})
-        tot_r += r; tot_b += b; valid_boards += 1
-    overall_ratio = None
-    if tot_r + tot_b > 0:
-        overall_ratio = tot_r / (tot_r + tot_b)
-    is_pumping = False; reasons = []
-    if overall_ratio is not None:
-        if overall_ratio >= 0.5 + prob_threshold:
-            is_pumping = True; reasons.append(f"整体偏红 (庄) {overall_ratio:.2f} >= 0.5+{prob_threshold}")
-        if overall_ratio <= 0.5 - prob_threshold:
-            is_pumping = True; reasons.append(f"整体偏蓝 (闲) {overall_ratio:.2f} <= 0.5-{prob_threshold}")
-    valid_ratios = [p["ratio"] for p in per if p["valid"] and p["ratio"] is not None]
-    if valid_ratios:
-        red_biased = sum(1 for r in valid_ratios if r >= 0.5 + prob_threshold)
-        blue_biased = sum(1 for r in valid_ratios if r <= 0.5 - prob_threshold)
-        if valid_ratios and red_biased / len(valid_ratios) >= 0.6:
-            is_pumping = True; reasons.append(f"{red_biased}/{len(valid_ratios)} 桌偏红 (>=60%)")
-        if valid_ratios and blue_biased / len(valid_ratios) >= 0.6:
-            is_pumping = True; reasons.append(f"{blue_biased}/{len(valid_ratios)} 桌偏蓝 (>=60%)")
-    return is_pumping, {"overall_ratio": overall_ratio, "boards_with_data": valid_boards, "per_board": per, "reasons": reasons}
-
-# ------------- Telegram -------------
-def send_telegram(text: str):
+def send_telegram(text):
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
-        logger.warning("TG_BOT_TOKEN 或 TG_CHAT_ID 未设置，无法发送通知")
+        log("Telegram 未配置（TG_BOT_TOKEN/TG_CHAT_ID 为空），跳过发送。")
         return False
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": TG_CHAT_ID, "text": text, "parse_mode":"HTML"}
     try:
-        r = requests.post(url, data={"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML"}, timeout=10)
-        if r.status_code == 200:
-            logger.info("Telegram 已发送")
+        r = requests.post(url, data=payload, timeout=30)
+        j = r.json()
+        if j.get("ok"):
+            log("Telegram 已发送")
             return True
-        logger.warning(f"Telegram 发送失败 HTTP {r.status_code} - {r.text}")
+        else:
+            log(f"Telegram API 返回错误：{j}")
+            return False
     except Exception as e:
-        logger.warning(f"Telegram 发送异常: {e}")
-    return False
+        log(f"发送 Telegram 错误：{e}")
+        return False
 
-# ------------- Playwright capture: 多次尝试 -------------
-def capture_with_retries(save_path: Path, tries=3):
-    """尝试多次打开不同 URL / viewport / 轻微滚动来尽量抓到盘面截图"""
-    save_path.parent.mkdir(parents=True, exist_ok=True)
-    urls = ["https://dg18.co/wap/", "https://dg18.co/", "https://dg18.co/wap/?r=1"]
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=["--no-sandbox","--disable-dev-shm-usage"])
-        context = browser.new_context(viewport={"width":1280, "height":1920}, user_agent=headers["User-Agent"])
-        page = context.new_page()
-        last_exc = None
-        for u in urls:
-            for t in range(tries):
-                try:
-                    logger.info(f"截图尝试 URL={u} 第 {t+1}/{tries}")
-                    page.goto(u, timeout=10000)
-                    # 尝试点击 Free / 点击可能的弹窗
-                    try:
-                        page.locator("text=Free").click(timeout=2000)
-                    except Exception:
-                        pass
-                    page.wait_for_timeout(400 + 200*t)
-                    # 轻微滚动组合尝试
-                    if t % 2 == 1:
-                        page.evaluate("window.scrollTo(0, document.body.scrollHeight/4)")
-                        page.wait_for_timeout(300)
-                    page.screenshot(path=str(save_path), full_page=True)
-                    logger.info(f"截图成功: {save_path}")
-                    browser.close()
-                    return True, u
-                except Exception as e:
-                    last_exc = e
-                    logger.warning(f"截图失败: {e}")
-                    continue
-        browser.close()
-        logger.error(f"所有截图尝试失败: {last_exc}")
-        return False, None
-
-# ------------- 历史判定 -------------
-def historical_pumping_check(history_db: dict, lookback_runs: int = HISTORY_WINDOW_RUNS, threshold: float = HISTORY_PROB_THRESHOLD):
-    """计算最近 lookback_runs 次是否有足够比例判定为 pumping"""
-    runs = history_db.get("runs", [])
-    if not runs:
-        return False, {"reason":"无历史数据"}
-    # 取最近 N runs
-    recent = runs[-lookback_runs:]
-    total = len(recent)
-    pumping_cnt = sum(1 for r in recent if r.get("is_pumping"))
-    if total == 0:
-        return False, {"reason":"无历史数据2"}
-    frac = pumping_cnt / total
-    reason = f"最近 {total} 次中 {pumping_cnt} 次被判為放水 (比例 {frac:.2f})"
-    return (frac >= threshold), {"fraction": frac, "pumping_cnt": pumping_cnt, "total": total, "reason": reason}
-
-# ------------- 主流程 -------------
-def run_once(image_path: Path, no_fetch: bool = False, force_fallback: bool = False):
-    logger.info("=== DG monitor run start ===")
-    ensure_placeholders()
-
-    screenshot_path = image_path
-    if not no_fetch:
-        ok, used_url = capture_with_retries(screenshot_path, tries=3)
-        if not ok:
-            logger.warning("抓取站点失败，尝试使用本地图片作为回退")
-            if not screenshot_path.exists():
-                logger.error("无可用图片，退出")
-                return
-    else:
-        if not screenshot_path.exists():
-            logger.error("指定本地图片不存在，退出")
-            return
-
-    # 读取图片（对 Windows 路径和非 UTF 路径更稳）
-    img = cv2.imdecode(np.fromfile(str(screenshot_path), dtype=np.uint8), cv2.IMREAD_COLOR)
-    if img is None:
-        logger.error("无法读取图片文件")
-        return
-
-    # 如果强制替补或优先替补（按你的要求：替补优先）
-    if force_fallback:
-        rects, method = aggressive_multi_pass_detect(img)
-    else:
-        # 优先尝试替补（fallback），如不足再合并/主检测等
-        rects, method = aggressive_multi_pass_detect(img)
-
-    logger.info(f"检测方法={method}, 检到桌子数={len(rects)} (阈值 {MIN_BOARDS_FOR_PAW})")
-
-    # 分析每桌颜色比例
-    is_pumping, details = detect_pumping_from_rects(img, rects, prob_threshold=HISTORY_PROB_THRESHOLD)
-
-    # 历史判定（从 history_db.json）
-    history_db = load_json_safe(HISTORY_DB_PATH, {"runs": []})
-    hist_flag, hist_details = historical_pumping_check(history_db, lookback_runs=HISTORY_WINDOW_RUNS, threshold=HISTORY_PROB_THRESHOLD)
-
-    # 准备要写入历史的一条记录
-    now_ts = datetime.now().isoformat()
-    run_entry = {
-        "ts": now_ts,
-        "method": method,
-        "detected_boards": len(rects),
-        "is_pumping": bool(is_pumping),
-        "overall_ratio": details.get("overall_ratio")
-    }
-    # 追加到历史并保存
-    history_db.setdefault("runs", []).append(run_entry)
-    # 保持历史长度合理
-    if len(history_db["runs"]) > 2000:
-        history_db["runs"] = history_db["runs"][-2000:]
-    save_json_safe(HISTORY_DB_PATH, history_db)
-
-    # 更新 stats
-    stats = load_json_safe(HISTORY_STATS_PATH, {"total_runs":0, "total_boards":0, "pumping_count":0})
-    stats["total_runs"] = stats.get("total_runs", 0) + 1
-    stats["total_boards"] = stats.get("total_boards", 0) + len(rects)
-    stats["pumping_count"] = stats.get("pumping_count", 0) + (1 if is_pumping else 0)
-    save_json_safe(HISTORY_STATS_PATH, stats)
-
-    # 保存 state/last_summary
-    state = load_json_safe(STATE_PATH, {})
-    state.update({
-        "last_run": now_ts,
-        "last_method": method,
-        "last_detected_boards": len(rects),
-        "last_is_pumping": bool(is_pumping)
-    })
-    save_json_safe(STATE_PATH, state)
-
-    last_summary = {"ts": now_ts, "summary": f"桌数={len(rects)} method={method} pumping={bool(is_pumping)}"}
-    save_json_safe(LAST_SUMMARY_PATH, last_summary)
-
-    # 决策：只要「实时判定为放水」或「历史判定阈值触发」就立即发 Telegram
-    should_notify = False
-    notify_reasons = []
-    if is_pumping:
-        should_notify = True
-        notify_reasons.append("实时判定：本次检测发现放水倾向")
-    if hist_flag:
-        should_notify = True
-        notify_reasons.append("历史判定：最近历史数据比例达到阈值")
-
-    if should_notify:
-        # 构造消息（保持你要求格式）
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        overall = details.get("overall_ratio")
-        boards_with_data = details.get("boards_with_data")
-        lines = [
-            f"<b>DG 放水警报</b> — {ts}",
-            f"检测方法: {method}",
-            f"检测到桌子数: {len(rects)}; 有效桌数: {boards_with_data}",
-            f"整体庄(红)占比: {overall:.2f}" if overall is not None else "整体占比: 无数据",
-            "判定原因: " + " ; ".join(notify_reasons),
-            "",
-            "每桌详情（显示 ratio 或 数据不足）:"
-        ]
-        for b in details["per_board"]:
-            if b["valid"] and b["ratio"] is not None:
-                lines.append(f"桌 {b['idx']}: 庄占比 {b['ratio']:.2f}")
-            else:
-                lines.append(f"桌 {b['idx']}: 数据不足")
-        if hist_flag:
-            lines.append("")
-            lines.append(f"历史判定细节: {hist_details.get('reason')}")
-        message = "\n".join(lines)
-        sent = send_telegram(message)
-        if not sent:
-            logger.warning("通知发送失败，请检查 TG_BOT_TOKEN / TG_CHAT_ID")
-    else:
-        logger.info("静默：既未实时判定放水，亦未满足历史判定阈值（不发通知）")
-
-    logger.info("=== DG monitor run end ===")
-    # 确保退出码 0 避免 CI 误判
+# ---------- state ----------
+def load_state():
+    if not os.path.exists(STATE_FILE):
+        s = {"active": False, "kind": None, "start_time": None, "estimated_end": None, "last_seen": None, "history": []}
+        return s
     try:
-        sys.exit(0)
-    except SystemExit:
-        pass
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {"active": False, "kind": None, "start_time": None, "estimated_end": None, "last_seen": None, "history": []}
 
-# ------------- CLI -------------
-def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument("--image", "-i", default=str(DEFAULT_LOCAL_IMAGE), help="本地图片路径（若不想从网站抓取传此参数）")
-    p.add_argument("--no-fetch", action="store_true", help="不抓取网站，直接使用本地图片")
-    p.add_argument("--force-fallback", action="store_true", help="强制替补检测（优先替补）")
-    return p.parse_args()
+def save_state(s):
+    with open(STATE_FILE,"w",encoding="utf-8") as f:
+        json.dump(s, f, ensure_ascii=False, indent=2)
+
+# ---------- image helpers ----------
+def pil_from_bytes(bts):
+    return Image.open(BytesIO(bts)).convert("RGB")
+
+def cv_from_pil(pil):
+    return cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
+
+def detect_red_blue_points(bgr_img):
+    """
+    检测红/蓝点，返回 point list: [(x,y,'B'|'P'), ...]
+    """
+    hsv = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2HSV)
+    # red
+    lower1 = np.array([0, 100, 80]); upper1 = np.array([10, 255, 255])
+    lower2 = np.array([160, 100, 80]); upper2 = np.array([179,255,255])
+    mask_r = cv2.inRange(hsv, lower1, upper1) | cv2.inRange(hsv, lower2, upper2)
+    # blue
+    lowerb = np.array([95, 60, 60]); upperb = np.array([135,255,255])
+    mask_b = cv2.inRange(hsv, lowerb, upperb)
+    # cleanup
+    k = np.ones((3,3),np.uint8)
+    mask_r = cv2.morphologyEx(mask_r, cv2.MORPH_OPEN, k, iterations=1)
+    mask_b = cv2.morphologyEx(mask_b, cv2.MORPH_OPEN, k, iterations=1)
+    points=[]
+    for mask,label in [(mask_r,'B'),(mask_b,'P')]:
+        cnts,_ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for c in cnts:
+            area = cv2.contourArea(c)
+            if area < 8: continue
+            M = cv2.moments(c)
+            if M.get("m00",0)==0: continue
+            cx = int(M["m10"]/M["m00"]); cy = int(M["m01"]/M["m00"])
+            points.append((cx,cy,label))
+    return points, mask_r, mask_b
+
+# ---------- cluster boards heuristic ----------
+def cluster_boards(points, img_w, img_h):
+    """
+    基于点密度把页面聚成若干候选小桌区域 (x,y,w,h) 列表
+    fallback: KMeans clustering
+    """
+    if not points:
+        return []
+    cell = max(64, int(min(img_w,img_h)/12))
+    cols = math.ceil(img_w/cell); rows = math.ceil(img_h/cell)
+    grid = [[0]*cols for _ in range(rows)]
+    for (x,y,_) in points:
+        cx = min(cols-1, x//cell); cy = min(rows-1, y//cell)
+        grid[cy][cx] += 1
+    thr = 6
+    hits=[]
+    for r in range(rows):
+        for c in range(cols):
+            if grid[r][c] >= thr: hits.append((r,c))
+    rects=[]
+    if hits:
+        for (r,c) in hits:
+            x = c*cell; y = r*cell; w = cell; h = cell
+            placed=False
+            for i,(rx,ry,rw,rh) in enumerate(rects):
+                if not (x > rx+rw+cell or x+w < rx-cell or y > ry+rh+cell or y+h < ry-cell):
+                    nx = min(rx,x); ny = min(ry,y)
+                    nw = max(rx+rw, x+w)-nx; nh = max(ry+rh, y+h)-ny
+                    rects[i] = (nx,ny,nw,nh)
+                    placed=True; break
+            if not placed:
+                rects.append((x,y,w,h))
+        # expand slightly
+        regs=[]
+        for (x,y,w,h) in rects:
+            nx = max(0,x-12); ny = max(0,y-12)
+            nw = min(img_w-nx, w+24); nh = min(img_h-ny, h+24)
+            regs.append((int(nx),int(ny),int(nw),int(nh)))
+        return regs
+    # fallback kmeans
+    coords = np.array([[p[0],p[1]] for p in points])
+    k = min(8, max(1, len(points)//8))
+    if k<=1:
+        return [(0,0,img_w,img_h)]
+    try:
+        km = KMeans(n_clusters=k, random_state=0).fit(coords)
+        regs=[]
+        for lab in range(k):
+            pts = coords[km.labels_==lab]
+            if pts.size==0: continue
+            x0,y0 = pts.min(axis=0); x1,y1 = pts.max(axis=0)
+            regs.append((int(max(0,x0-8)), int(max(0,y0-8)), int(min(img_w, x1-x0+16)), int(min(img_h,y1-y0+16))))
+        return regs
+    except Exception:
+        return [(0,0,img_w,img_h)]
+
+# ---------- analyze single board ----------
+def analyze_board_region(img_bgr, region):
+    x,y,w,h = region
+    crop = img_bgr[y:y+h, x:x+w]
+    pts, mr, mb = detect_red_blue_points(crop)
+    if not pts:
+        return {"total":0, "maxRun":0, "category":"empty", "runs":[], "cols_info":[]}
+    # cluster points into columns by x coordinate
+    pts_sorted = sorted(pts, key=lambda p: p[0])
+    xs = [p[0] for p in pts_sorted]
+    # group by gap threshold
+    groups = []
+    gap = max(10, w//40)
+    for idx,p in enumerate(pts_sorted):
+        if not groups:
+            groups.append([p])
+        else:
+            last = groups[-1][-1]
+            if p[0] - last[0] <= gap:
+                groups[-1].append(p)
+            else:
+                groups.append([p])
+    # for each column group, sort by y, produce color sequence
+    cols_seq = []
+    cols_info = []
+    for col in groups:
+        col_sorted = sorted(col, key=lambda z: z[1])
+        seq = [z[2] for z in col_sorted]
+        cols_seq.append(seq)
+        # find max contiguous run length within column (top->bottom)
+        maxrun = 0
+        cur = None; curc=0
+        for c in seq:
+            if c==cur:
+                curc+=1
+            else:
+                if curc>maxrun: maxrun=curc
+                cur = c; curc=1
+        if curc>maxrun: maxrun=curc
+        cols_info.append({"col_len":len(seq), "max_run_in_col":maxrun})
+    # flatten reading columns left->right, top->bottom
+    flattened=[]
+    max_h = max((len(s) for s in cols_seq), default=0)
+    for r in range(max_h):
+        for c in cols_seq:
+            if r < len(c): flattened.append(c[r])
+    # compute runs across flattened
+    runs=[]
+    if flattened:
+        cur = {"color":flattened[0], "len":1}
+        for i in range(1,len(flattened)):
+            if flattened[i]==cur["color"]:
+                cur["len"] += 1
+            else:
+                runs.append(cur); cur={"color":flattened[i],"len":1}
+        runs.append(cur)
+    maxRun = max((r["len"] for r in runs), default=0)
+    category = "other"
+    if maxRun >= 10: category="super_long"
+    elif maxRun >= 8: category="long"
+    elif maxRun >= 4: category="longish"
+    # detect 多连连续3排（heuristic）：
+    # 若在 cols_info 中，存在 >=3 个连续列（邻近列）其 max_run_in_col >=4 -> 视为 连续3排多连/连珠
+    consecutive = 0; max_consecutive=0
+    for info in cols_info:
+        if info["max_run_in_col"] >= 4:
+            consecutive +=1
+        else:
+            max_consecutive = max(max_consecutive, consecutive)
+            consecutive = 0
+    max_consecutive = max(max_consecutive, consecutive)
+    has_3row_mult = (max_consecutive >= 3)
+    return {"total":len(flattened), "maxRun": maxRun, "category": category, "runs": runs, "cols_info": cols_info, "has_3row_mult": has_3row_mult}
+
+# ---------- classify overall ----------
+def classify_boards(board_stats):
+    longCount = sum(1 for b in board_stats if b['category'] in ('long','super_long'))
+    superCount = sum(1 for b in board_stats if b['category']=='super_long')
+    longishCount = sum(1 for b in board_stats if b['category']=='longish')
+    # check how many boards have has_3row_mult
+    multi3_count = sum(1 for b in board_stats if b.get('has_3row_mult'))
+    n = len(board_stats)
+    # 放水: 至少 MIN_BOARDS_FOR_PAW 张处于 长龙/超长龙（>= MIN_BOARDS_FOR_PAW）
+    if longCount >= MIN_BOARDS_FOR_PAW:
+        return "放水时段（提高胜率）", longCount, superCount, multi3_count
+    # 中等胜率（中上）：存在 >=3 张桌呈连续3排多连/连珠 + 至少 MID_LONG_REQ 张龙/超龙 (可同桌)
+    if multi3_count >= 3 and longCount >= MID_LONG_REQ:
+        return "中等胜率（中上）", longCount, superCount, multi3_count
+    # 收割：多数桌稀疏
+    sparse = sum(1 for b in board_stats if b["total"] < 6)
+    if n>0 and sparse >= n*0.6:
+        return "胜率调低 / 收割时段", longCount, superCount, multi3_count
+    return "胜率中等（平台收割中等时段）", longCount, superCount, multi3_count
+
+# ---------- capture DG screenshot with playwright ----------
+def capture_dg_screenshot(playwright, url, max_wait=35):
+    browser = playwright.chromium.launch(headless=True, args=["--no-sandbox","--disable-gpu"])
+    try:
+        ctx = browser.new_context(viewport={"width":1366,"height":768})
+        page = ctx.new_page()
+        log(f"打开 {url}")
+        page.goto(url, timeout=30000)
+        time.sleep(2)
+        # 尝试点击多种 Free / 免费试玩 文本
+        tried = False
+        for txt in ["Free", "免费试玩", "免费", "Play Free", "试玩", "FREE"]:
+            try:
+                locator = page.locator(f"text={txt}")
+                if locator.count() > 0:
+                    locator.first.click(timeout=4000)
+                    log(f"点击文字: {txt}")
+                    tried = True
+                    break
+            except Exception:
+                continue
+        time.sleep(2)
+        # 滚动以触发可能的安全滑动条
+        try:
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight);")
+            time.sleep(0.6)
+            page.evaluate("window.scrollTo(0, 0);")
+            time.sleep(0.6)
+        except Exception:
+            pass
+        time.sleep(3)
+        # 再尝试等待某些关键节点？（由于页面差异，这里做宽松等待）
+        try:
+            shot = page.screenshot(full_page=True)
+            log("截图完成")
+            return shot
+        except Exception as e:
+            log(f"截图失败：{e}")
+            return None
+    finally:
+        try:
+            browser.close()
+        except:
+            pass
+
+# ---------- main ----------
+def main():
+    state = load_state()
+    log("==== 新一轮检测开始 ====")
+    # If already active and an estimated_end exists and current time < estimated_end:
+    #   --> 为减少误判/避免频繁截图，短路本次检测（但仍保留运行以满足 GitHub Actions 调度）。
+    now = datetime.now(TZ)
+    if state.get("active"):
+        est = state.get("estimated_end")
+        if est:
+            est_dt = datetime.fromisoformat(est)
+            if now < est_dt:
+                log(f"当前已有活动（{state.get('kind')}），并在预计结束时间 {est_dt.strftime('%Y-%m-%d %H:%M')} 之前。跳过本次重截图检测。")
+                # 仍保存 last_seen
+                state["last_seen"] = now.isoformat()
+                save_state(state)
+                return
+    # else 执行正常抓取与识别
+    screenshot = None
+    with sync_playwright() as p:
+        for url in DG_LINKS:
+            try:
+                screenshot = capture_dg_screenshot(p, url)
+                if screenshot:
+                    break
+            except Exception as e:
+                log(f"访问 {url} 异常：{e}")
+                continue
+    if not screenshot:
+        log("无法获取到任何截图，本次结束。")
+        # optionally send an error message to Telegram on repeated failures? （略）
+        save_state(state)
+        return
+    pil = pil_from_bytes(screenshot)
+    bgr = cv_from_pil(pil)
+    h,w = bgr.shape[:2]
+    if DEBUG_SAVE_IMAGE:
+        cv2.imwrite("last_screenshot.png", bgr)
+    pts, mr, mb = detect_red_blue_points(bgr)
+    log(f"检测到彩点总数: {len(pts)}")
+    if len(pts) == 0:
+        log("页面可能未加载正确或颜色阈值不匹配，结束本次。")
+        save_state(state); return
+    regions = cluster_boards(pts, w, h)
+    log(f"聚类出候选桌子：{len(regions)}")
+    board_stats=[]
+    for reg in regions:
+        st = analyze_board_region(bgr, reg)
+        board_stats.append(st)
+    overall, longCount, superCount, multi3_count = classify_boards(board_stats)
+    log(f"判定结果 => {overall} (长/超长龙桌数={longCount}, 超长龙={superCount}, 连续3排多连桌数={multi3_count})")
+    # update summary
+    summary = {"ts": now.isoformat(), "overall":overall, "longCount":longCount, "superCount":superCount, "multi3_count":multi3_count, "boards_count":len(board_stats)}
+    with open(LAST_SUMMARY,"w",encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+    # state transitions
+    was_active = state.get("active", False)
+    was_kind = state.get("kind", None)
+    is_active_now = overall in ("放水时段（提高胜率）", "中等胜率（中上）")
+    if is_active_now and not was_active:
+        # start event
+        state["active"] = True
+        state["kind"] = overall
+        state["start_time"] = now.isoformat()
+        # estimate duration based on history average (use median of history durations if available)
+        hist = state.get("history", [])
+        durations = [h.get("duration_minutes",0) for h in hist if h.get("duration_minutes",0)>0]
+        est_minutes = 10
+        if durations:
+            est_minutes = int(round(sum(durations)/len(durations)))
+            # guard
+            est_minutes = max(5, min(est_minutes, 120))
+        est_end = now + timedelta(minutes=est_minutes)
+        state["estimated_end"] = est_end.isoformat()
+        state["last_seen"] = now.isoformat()
+        save_state(state)
+        # Send Telegram start notification (with emoji)
+        est_end_str = est_end.astimezone(TZ).strftime("%Y-%m-%d %H:%M")
+        emoji = "🔔"
+        msg = f"{emoji} <b>DG 提醒 — {overall} 開始</b>\n時間: {now.astimezone(TZ).strftime('%Y-%m-%d %H:%M')}\n長/超长龙桌數={longCount}, 超长龙={superCount}, 連續3排多連桌數={multi3_count}\n估計結束時間（基於歷史/近似）: {est_end_str}（約 {est_minutes} 分鐘）"
+        send_telegram(msg)
+        log("事件已標記為 active 並發送開始通知。")
+    elif is_active_now and was_active:
+        # still active: update last_seen and possibly adjust estimated_end if very long
+        state["last_seen"] = now.isoformat()
+        save_state(state)
+        log("事件仍持續中，已更新 last_seen。")
+    elif (not is_active_now) and was_active:
+        # event ended -> compute actual duration and push to history
+        start_iso = state.get("start_time")
+        if start_iso:
+            start_dt = datetime.fromisoformat(start_iso)
+            duration_min = int(round((now - start_dt).total_seconds()/60.0))
+        else:
+            duration_min = 0
+        hist = state.get("history", [])
+        hist.append({"kind": state.get("kind"), "start_time": state.get("start_time"), "end_time": now.isoformat(), "duration_minutes": duration_min})
+        # keep last N
+        state = {"active": False, "kind": None, "start_time": None, "estimated_end": None, "last_seen": None, "history": hist[-120:]}
+        save_state(state)
+        emoji="✅"
+        msg = f"{emoji} <b>DG 提醒 — {was_kind} 已结束</b>\n開始: {start_iso}\n結束: {now.isoformat()}\n實際持續: {duration_min} 分鐘"
+        send_telegram(msg)
+        log("事件结束，已发送结束通知并记录历史。")
+    else:
+        # not active, not previously active
+        state["last_seen"] = now.isoformat()
+        save_state(state)
+        log("当前不属于放水/中上，不发送提醒。")
+    log("==== 本次检测结束 ====")
 
 if __name__ == "__main__":
-    ensure_placeholders()
-    args = parse_args()
     try:
-        run_once(Path(args.image), no_fetch=args.no_fetch, force_fallback=args.force_fallback)
+        main()
     except Exception as e:
-        logger.exception(f"未捕获异常: {e}")
-        st = load_json_safe(STATE_PATH, {})
-        st.update({"error": str(e), "error_ts": datetime.now().isoformat()})
-        save_json_safe(STATE_PATH, st)
-        ensure_placeholders()
-        # 保持 exit 0，避免 CI 失败（如你之前要求）
+        log("脚本异常: " + str(e))
+        traceback.print_exc()
+        # 发错警告到 Telegram（可选）
         try:
-            sys.exit(0)
-        except SystemExit:
+            send_telegram("⚠️ <b>DG 监测脚本发生异常</b>\n" + str(e))
+        except:
             pass
+        raise
