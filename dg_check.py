@@ -13,7 +13,7 @@ from playwright.sync_api import sync_playwright
 # ---------------- CONFIG ----------------
 # Default to the link you provided
 DG_URL = os.environ.get("DG_URL",
-    "https://new-dd-cloudfront.ywjxi.com/ddnewpc/index.html?token=aed603b4a80749c2ab892e1b8c4f79a7&language=en&type=2&return=dggw.vip"
+    "https://new-dd-cloudfront.ywjxi.com/ddnewpc/index.html?token=64c9e68d047142539ff3b4b5048b0ac4&language=en&type=2&return=dggw.vip"
 )
 
 # Telegram (must set in GitHub Secrets)
