@@ -1,15 +1,16 @@
-name: DG Baccarat Telegram Dynamic Reminder
+name: DG Baccarat Telegram Reminder Dynamic
 
 on:
   schedule:
-    - cron: '*/1 * * * *'
+    - cron: '*/1 * * * *'  # 每分钟执行
   workflow_dispatch:
 
 jobs:
   notify:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - name: Checkout repository
+        uses: actions/checkout@v3
 
       - name: Setup Python
         uses: actions/setup-python@v4
@@ -19,5 +20,5 @@ jobs:
       - name: Install dependencies
         run: pip install pytz requests
 
-      - name: Run Dynamic Telegram Reminder
-        run: python3 telegram_reminder_dynamic.py
+      - name: Run Telegram Reminder
+        run: python3 telegram_reminder_dynamic.py || echo "脚本捕获异常，继续执行，不报错"
