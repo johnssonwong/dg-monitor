@@ -1,0 +1,24 @@
+name: DG Baccarat Telegram Reminder
+
+on:
+  schedule:
+    - cron: '*/1 * * * *'  # 每分钟执行
+  workflow_dispatch:
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.x'
+
+      - name: Install dependencies
+        run: pip install pytz requests
+
+      - name: Run Telegram Reminder
+        run: python3 telegram_reminder_dynamic.py
