@@ -2,7 +2,7 @@ name: DG Road Checker
 
 on:
   schedule:
-    - cron: '*/2 * * * *'   # 每 2 分钟运行一次，若要更密集请改为 '*/1 * * * *'
+    - cron: '*/2 * * * *'   # 每 2 分钟运行一次（可改为 '*/1 * * * *'）
   workflow_dispatch:
 
 jobs:
@@ -17,7 +17,7 @@ jobs:
         with:
           python-version: "3.10"
 
-      - name: Install dependencies
+      - name: Install dependencies & Playwright
         run: |
           python -m pip install --upgrade pip
           pip install playwright requests pytz
@@ -25,7 +25,7 @@ jobs:
 
       - name: Run DG checker
         env:
-          DG_URL: ${{ secrets.DG_URL }}     # optional, can embed URL directly in script
+          DG_URL: ${{ secrets.DG_URL }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: python dg_check.py
