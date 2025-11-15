@@ -1,4 +1,0 @@
-playwright>=1.39.1
-opencv-python-headless
-numpy
-requests
