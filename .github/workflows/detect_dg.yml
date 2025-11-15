@@ -1,21 +1,24 @@
-name: DG Water Alert
+name: DG Detect & Telegram Alert
 
 on:
   schedule:
-    - cron: '*/5 * * * *' # 每5分钟自动执行一次
+    - cron: '*/1 * * * *'  # 每1分钟运行一次
   workflow_dispatch:
 
 jobs:
-  notify:
+  detect:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3
+
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: 3.x
+          python-version: '3.11'
+
       - name: Install dependencies
         run: pip install requests pytz
-      - name: Run Telegram Alert Script
-        run: python script.py
+
+      - name: Run DG detector
+        run: python detect_dg.py
