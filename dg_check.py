@@ -1,20 +1,22 @@
 # dg_check.py
 # Playwright-based DG roadmap checker + Telegram notifier
 # NOTE: requires environment variables in GitHub Secrets:
-#   DG_URL (optional if using fixed link), DG_USER (optional), DG_PASS (optional)
 #   TG_BOT_TOKEN, TG_CHAT_ID
+# Optional: DG_URL in secrets (otherwise uses built-in default)
 
-import os, json, re, time
+import os, json, re
 from datetime import datetime
 import pytz
 import requests
 from playwright.sync_api import sync_playwright
 
 # ---------------- CONFIG ----------------
-# 若你想直接内嵌你给的代理链接，可把下面 DG_URL 默认改为该链接（或放到 Secrets）
-DG_URL = os.environ.get("DG_URL", "https://new-dd-cn.20299999.com/ddnewwap/index.html?token=a2455cf62fc14d2f9c424039f07a7c8f&language=en&type=2&return=dggw.vip")
+# Default to the link you provided
+DG_URL = os.environ.get("DG_URL",
+    "https://new-dd-cloudfront.ywjxi.com/ddnewpc/index.html?token=aed603b4a80749c2ab892e1b8c4f79a7&language=en&type=2&return=dggw.vip"
+)
 
-# Telegram
+# Telegram (must set in GitHub Secrets)
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID")
 
@@ -30,10 +32,10 @@ ROAD_SELECTORS = [
     ".history", ".table-road", "div.road-wrap", ".road-list"
 ]
 
-# your rules thresholds
-LONG_RUN_K = 5   # 连5 (you treat >=4 as 连; we use 5 as target for detection of strong streaks)
-DRAGON_K = 8     # 长龙
-SUPER_K = 10     # 超长龙
+# detection thresholds (tunable)
+LONG_RUN_K = 5   # treat >=5 as strong long run
+DRAGON_K = 8     # dragon
+SUPER_K = 10     # super dragon
 
 # ---------------- util ----------------
 def send_telegram(text):
@@ -42,7 +44,7 @@ def send_telegram(text):
         return
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
     try:
-        requests.post(url, data={"chat_id": TG_CHAT_ID, "text": text})
+        requests.post(url, data={"chat_id": TG_CHAT_ID, "text": text}, timeout=15)
     except Exception as e:
         print("Telegram send failed:", e)
 
@@ -56,25 +58,19 @@ def load_state():
     return {"active": False, "type": None, "start_time": None}
 
 def save_state(s):
-    with open(STATE_FILE, "w") as f:
-        json.dump(s, f)
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump(s, f)
+    except:
+        pass
 
-# analyze a text representation of a road: returns dict with counts
 def analyze_sequence(seq_text):
-    """
-    Given a string containing markers like 'B','P' or Chinese 庄/闲 etc,
-    normalize to 'B' (banker/庄) and 'P' (player/闲) and analyze streaks.
-    """
     if not seq_text:
         return None
-    # normalize
     s = seq_text.upper()
     s = s.replace("庄", "B").replace("閒", "P").replace("闲", "P").replace("和", "T")
-    # also common ascii markers
-    s = re.sub(r"[^BP T]", "", s)
-    # collapse spaces
+    s = re.sub(r"[^BPT ]", lambda m: m.group(0), s)  # keep B,P,T if present
     s = s.replace(" ", "")
-    # attempt to extract longest same-side streak
     max_b = max_p = 0
     cur = None
     cur_len = 0
@@ -93,15 +89,9 @@ def analyze_sequence(seq_text):
     total_length = len([c for c in s if c in ("B","P")])
     return {"total": total_length, "max_b": max_b, "max_p": max_p, "raw": s}
 
-# strong-check across multiple parsed tables
 def decide_overall(parsed_list):
-    """
-    parsed_list: list of analyze_sequence results for many tables
-    returns: ("HIGH"/"MEDIUM"/None, details)
-    """
     if not parsed_list:
         return None, {}
-    # count tables with streak >= DRAGON_K, >= LONG_RUN_K etc
     cnt_dragon = 0
     cnt_long = 0
     cnt_any = 0
@@ -113,14 +103,14 @@ def decide_overall(parsed_list):
             cnt_long += 1
         if p.get("total",0) >= 10:
             cnt_any += 1
-    # heuristic thresholds - you can tune
+    # heuristics (tunable)
     if cnt_dragon >= 3 or cnt_long >= 6:
         return "HIGH", {"cnt_dragon": cnt_dragon, "cnt_long": cnt_long, "cnt_any": cnt_any}
     if cnt_long >= 3 or cnt_any >= 10:
         return "MEDIUM", {"cnt_dragon": cnt_dragon, "cnt_long": cnt_long, "cnt_any": cnt_any}
     return None, {"cnt_dragon": cnt_dragon, "cnt_long": cnt_long, "cnt_any": cnt_any}
 
-# ---------------- main scraping logic ----------------
+# ---------------- scraping ----------------
 def scrape_and_analyze(url):
     results = []
     screenshot_path = None
@@ -129,9 +119,7 @@ def scrape_and_analyze(url):
         context = browser.new_context()
         page = context.new_page()
         page.goto(url, wait_until="networkidle", timeout=45000)
-        # try to wait a bit
-        page.wait_for_timeout(2000)
-        # attempt to pull text from many selectors
+        page.wait_for_timeout(1500)
         for sel in ROAD_SELECTORS:
             try:
                 elems = page.query_selector_all(sel)
@@ -147,38 +135,38 @@ def scrape_and_analyze(url):
                             pass
             except Exception:
                 pass
-        # fallback: try to find common textual road markers
-        # attempt to get any visible text that contains 庄/闲 or B/P sequence
-        body_text = page.inner_text("body")
-        if body_text and ("庄" in body_text or "闲" in body_text or "B" in body_text or "P" in body_text):
-            # try to extract sequences lines
-            candidate_lines = [line.strip() for line in body_text.splitlines() if len(line.strip())>0]
-            for line in candidate_lines[-30:]:  # last lines
-                if any(ch in line for ch in ["庄","闲","B","P"]):
-                    a = analyze_sequence(line)
-                    if a:
-                        results.append(a)
-        # if nothing parsed, take screenshot for manual inspect
+        # fallback: read body text
+        try:
+            body_text = page.inner_text("body")
+            if body_text and ("庄" in body_text or "闲" in body_text or "B" in body_text or "P" in body_text):
+                candidate_lines = [line.strip() for line in body_text.splitlines() if len(line.strip())>0]
+                for line in candidate_lines[-40:]:
+                    if any(ch in line for ch in ["庄","闲","B","P"]):
+                        a = analyze_sequence(line)
+                        if a:
+                            results.append(a)
+        except Exception:
+            pass
         if not results:
             screenshot_path = "dg_page.png"
-            page.screenshot(path=screenshot_path, full_page=True)
+            try:
+                page.screenshot(path=screenshot_path, full_page=True)
+            except:
+                pass
         browser.close()
     return results, screenshot_path
 
 # ---------------- main ----------------
 def main():
     url = DG_URL
-    print("Starting check for", url)
-    parsed, shot = None, None
+    parsed = []
+    shot = None
     try:
         parsed, shot = scrape_and_analyze(url)
     except Exception as e:
-        print("Scrape error:", e)
-        # send heartbeat error message and attach nothing
         send_telegram(f"⚠ DG checker error at {datetime.now(tz).strftime('%Y-%m-%d %H:%M:%S')}: {e}")
         return
 
-    # make decision
     status, info = decide_overall(parsed)
     state = load_state()
     now_str = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
@@ -190,8 +178,7 @@ def main():
             state["start_time"] = now_str
             msg = f"🎊 DG 放水（高胜率）侦测 ✅\n时间: {now_str}\n详情: {info}\n说明: 多桌长龙/长连显著，建议观测并准备入场"
             if shot:
-                send_telegram(msg + "\n(无法自动解析路单，已截图发送，请查看手动确认。)")
-                # send screenshot as file
+                send_telegram(msg + "\n(已截图，无法自动解析路单请查看图片。)")
                 try:
                     files_url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendPhoto"
                     with open(shot, "rb") as f:
@@ -208,19 +195,20 @@ def main():
             msg = f"✨ DG 中等胜率时段 侦测 ⚠\n时间: {now_str}\n详情: {info}\n说明: 多桌出现长连/连珠的迹象，可小仓观察"
             send_telegram(msg)
     else:
-        # no signal; if previously active, send end notification
         if state.get("active"):
             start_time = state.get("start_time")
-            t0 = datetime.strptime(start_time, "%Y-%m-%d %H:%M:%S")
+            try:
+                t0 = datetime.strptime(start_time, "%Y-%m-%d %H:%M:%S")
+            except:
+                t0 = datetime.now(tz)
             t1 = datetime.now(tz)
             duration_min = int((t1 - t0).total_seconds() // 60)
-            msg = f"⏹ DG 放水/中等胜率 已结束 🏁\n开始时间: {start_time}\n结束时间: {t1.strftime('%Y-%m-%d %H:%M:%S')}\n共持续: {duration_min} 分钟\n(详情: {state.get('type')})"
+            msg = f"⏹ DG 放水/中等胜率 已结束 🏁\n开始时间: {start_time}\n结束时间: {t1.strftime('%Y-%m-%d %H:%M:%S')}\n共持续: {duration_min} 分钟\n(类型: {state.get('type')})"
             send_telegram(msg)
             state = {"active": False, "type": None, "start_time": None}
 
-    # save state
     save_state(state)
-    # if we produced screenshot but no parsed result, send screenshot as heartbeat (once)
+
     if shot and not parsed:
         try:
             with open(shot, "rb") as f:
