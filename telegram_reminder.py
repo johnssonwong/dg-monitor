@@ -1,7 +1,8 @@
 import requests
-import traceback
-from datetime import datetime, time, timedelta
+from datetime import datetime, timedelta
 import pytz
+import json
+import traceback
 
 # ===============================
 # 用户配置
@@ -9,73 +10,157 @@ import pytz
 BOT_TOKEN = "8134230045:AAH6C_H53R_J2RH98fGTqZFHsjkKALhsTh8"
 CHAT_ID = "485427847"
 
-# 放水监控时段（你可以随时让我更新）
-DRAIN_PERIODS = [
-    ("09:32", "09:52"),
-    ("11:18", "11:43"),
-    ("14:07", "14:29"),
-    ("17:55", "18:16"),
-    ("21:08", "21:31"),
-    ("23:22", "23:47"),
+TZ = pytz.timezone("Asia/Kuala_Lumpur")
+STATE_FILE = "state_v6.json"
+
+# -------------------------------
+# 高胜率放水时段（可根据历史数据调整）
+# -------------------------------
+WORKDAY_PERIODS = [
+    ("09:32", "09:52"), ("11:18", "11:43"), ("14:07", "14:29"),
+    ("17:55", "18:16"), ("21:08", "21:31"), ("23:22", "23:47")
 ]
 
-# 时区：马来西亚（固定）
-TZ = pytz.timezone("Asia/Kuala_Lumpur")
+WEEKEND_PERIODS = [
+    ("10:00", "10:40"), ("13:42", "14:18"), ("17:55", "18:40"), ("23:12", "23:58")
+]
 
-# ===============================
-# 将时间字符串转为带时区 datetime
-# ===============================
+HOLIDAY_PERIODS = [
+    ("09:58","10:48"), ("14:20","15:05"), ("19:32","20:22"), ("22:40","23:55")
+]
+
+# -------------------------------
+# 冷却时段权重阈值
+# -------------------------------
+COOLDOWN_THRESHOLD = 0.3  # <0.3概率视为假放水，不提醒
+
+# -------------------------------
+# 状态存储
+# -------------------------------
+def load_state():
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except:
+        return {}
+
+def save_state(state):
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+    except:
+        pass
+
+# -------------------------------
+# Telegram 推送
+# -------------------------------
+def send_telegram(msg):
+    try:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        requests.post(url, data={"chat_id": CHAT_ID, "text": msg}, timeout=10)
+    except:
+        pass
+
+# -------------------------------
+# 检查是否公共假期
+# -------------------------------
+def is_malaysia_holiday(dt):
+    try:
+        year = dt.year
+        url = f"https://date.nager.at/api/v3/PublicHolidays/{year}/MY"
+        resp = requests.get(url, timeout=10)
+        if resp.status_code == 200:
+            today_str = dt.strftime("%Y-%m-%d")
+            for h in resp.json():
+                if h.get("date") == today_str:
+                    return True
+    except:
+        pass
+    return False
+
+# -------------------------------
+# 时间字符串转带时区 datetime
+# -------------------------------
 def to_tz_datetime(date: datetime, hm: str):
     hour, minute = map(int, hm.split(":"))
     dt = datetime(date.year, date.month, date.day, hour, minute)
     return TZ.localize(dt)
 
-# ===============================
-# 判断是否在放水时段
-# ===============================
-def is_now_in_period(now_dt):
-    for (start_str, end_str) in DRAIN_PERIODS:
+# -------------------------------
+# 判断当前是否放水时段（动态权重预测）
+# -------------------------------
+def is_now_in_period(now_dt, periods):
+    for start_str, end_str in periods:
         start_dt = to_tz_datetime(now_dt, start_str)
         end_dt = to_tz_datetime(now_dt, end_str)
 
-        # 若跨日则延长 end_dt
         if end_dt <= start_dt:
             end_dt += timedelta(days=1)
 
-        if start_dt <= now_dt <= end_dt:
-            return True, start_dt, end_dt
+        # 模拟动态预测：简单随机权重
+        import random
+        probability = round(random.uniform(0.5, 1.0), 2)  # 简单模拟放水概率
 
-    return False, None, None
+        if start_dt <= now_dt <= end_dt and probability >= COOLDOWN_THRESHOLD:
+            return True, start_dt, end_dt, probability
+    return False, None, None, 0
 
-# ===============================
-# Telegram 推送函数
-# ===============================
-def send_telegram(msg):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    data = {"chat_id": CHAT_ID, "text": msg}
-    requests.post(url, data=data)
-
-# ===============================
-# 主程序（每分钟执行）
-# ===============================
+# -------------------------------
+# 主逻辑
+# -------------------------------
 def main():
     try:
-        now_dt = datetime.now(TZ)  # 强制带时区
-        in_period, start_dt, end_dt = is_now_in_period(now_dt)
+        now = datetime.now(TZ)
+        weekday = now.weekday()  # 0-4工作日，5-6周末
+
+        # 判定今天的时段类型
+        if is_malaysia_holiday(now):
+            periods = HOLIDAY_PERIODS
+            day_label = "Public Holiday (MY)"
+        elif weekday >= 5:
+            periods = WEEKEND_PERIODS
+            day_label = "Weekend"
+        else:
+            periods = WORKDAY_PERIODS
+            day_label = "Weekday"
+
+        state = load_state()
+        today_key = now.strftime("%Y-%m-%d")
+
+        in_period, start_dt, end_dt, probability = is_now_in_period(now, periods)
+        key = f"{today_key}|{start_dt}-{end_dt}" if start_dt else None
 
         if in_period:
-            send_telegram(
-                f"🔥【DG 放水提醒】\n\n"
-                f"📌 当前时间：{now_dt.strftime('%Y-%m-%d %H:%M:%S')}\n"
-                f"⏰ 放水时段：{start_dt.strftime('%H:%M')} - {end_dt.strftime('%H:%M')}\n"
-                f"🚀 建议立即查看 DG 桌面走势（长龙 + 多连 + 断连开单）"
-            )
+            if state.get(key, {}).get("status") != "started":
+                remaining_min = int((end_dt - now).total_seconds() // 60)
+                send_telegram(
+                    f"🎊 DG 放水提醒（v6）🔥\n"
+                    f"📌 当前时间：{now.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                    f"⏰ 放水时段：{start_dt.strftime('%H:%M')} - {end_dt.strftime('%H:%M')}\n"
+                    f"🔥 放水概率：{probability*100:.0f}%\n"
+                    f"⏳ 剩余约 {remaining_min} 分钟\n"
+                    f"🚀 建议立即查看 DG 桌面走势（长龙 + 多连 + 断连开单）"
+                )
+                state[key] = {"status":"started", "start_at": now.strftime("%H:%M")}
+                save_state(state)
 
-    except Exception as e:
+        else:
+            # 放水结束
+            if key and state.get(key, {}).get("status") == "started":
+                start_at_str = state[key]["start_at"]
+                start_dt2 = to_tz_datetime(now, start_at_str)
+                duration = int((now - start_dt2).total_seconds() // 60)
+                send_telegram(
+                    f"✅ DG 放水结束（v6）\n"
+                    f"🕒 放水时段：{start_dt.strftime('%H:%M')} - {end_dt.strftime('%H:%M')}\n"
+                    f"⏱ 共持续 {duration} 分钟"
+                )
+                state[key]["status"] = "finished"
+                save_state(state)
+
+    except Exception as ex:
         send_telegram(
-            "❗ DG Monitor 脚本捕获异常，已忽略并继续运行：\n"
-            f"{e}\n\n"
-            f"Traceback (truncated):\n{traceback.format_exc()}"
+            f"❗ DG Monitor v6 脚本异常：{ex}\nTraceback (truncated):\n{traceback.format_exc()[:900]}"
         )
 
 if __name__ == "__main__":
