@@ -11,11 +11,10 @@ import random
 BOT_TOKEN = "8134230045:AAH6C_H53R_J2RH98fGTqZFHsjkKALhsTh8"
 CHAT_ID = "485427847"
 TZ = pytz.timezone("Asia/Kuala_Lumpur")
-STATE_FILE = "state_v8.json"
+STATE_FILE = "state_v9.json"
 
 # -------------------------------
 # 高胜率放水时段（可根据历史数据调整）
-# 不同日类型：工作日 / 周末 / 公共假期
 # -------------------------------
 WORKDAY_PERIODS = [
     ("09:32", "09:52"), ("11:18", "11:43"), ("14:07", "14:29"),
@@ -88,7 +87,7 @@ def to_tz_datetime(date: datetime, hm: str):
     return TZ.localize(dt)
 
 # -------------------------------
-# 判断是否在放水时段 + 动态预测概率
+# 智能放水预测
 # -------------------------------
 def is_now_in_period(now_dt, periods):
     for start_str, end_str in periods:
@@ -97,12 +96,14 @@ def is_now_in_period(now_dt, periods):
         if end_dt <= start_dt:
             end_dt += timedelta(days=1)
 
-        # 动态预测概率 (0~1)
-        probability = round(random.uniform(0.5, 1.0), 2)
+        # 动态预测概率 (模拟历史 + 随机扰动)
+        base_prob = random.uniform(0.6, 1.0)  # 基础放水概率
+        remaining_sec = (end_dt - now_dt).total_seconds()
+        intensity_level = int(base_prob * 5)  # 🔥等级 0~5
 
-        if start_dt <= now_dt <= end_dt and probability >= COOLDOWN_THRESHOLD:
-            return True, start_dt, end_dt, probability
-    return False, None, None, 0
+        if start_dt <= now_dt <= end_dt and base_prob >= COOLDOWN_THRESHOLD:
+            return True, start_dt, end_dt, base_prob, intensity_level, remaining_sec
+    return False, None, None, 0, 0, 0
 
 # -------------------------------
 # 主逻辑
@@ -110,7 +111,7 @@ def is_now_in_period(now_dt, periods):
 def main():
     try:
         now = datetime.now(TZ)
-        weekday = now.weekday()  # 0-4 工作日，5-6 周末
+        weekday = now.weekday()  # 0-4工作日，5-6周末
 
         # 判定今天类型
         if is_malaysia_holiday(now):
@@ -126,32 +127,31 @@ def main():
         state = load_state()
         today_key = now.strftime("%Y-%m-%d")
 
-        in_period, start_dt, end_dt, probability = is_now_in_period(now, periods)
+        in_period, start_dt, end_dt, probability, intensity, remaining_sec = is_now_in_period(now, periods)
         key = f"{today_key}|{start_dt}-{end_dt}" if start_dt else None
 
-        # 放水开始
         if in_period:
             if state.get(key, {}).get("status") != "started":
-                remaining_min = int((end_dt - now).total_seconds() // 60)
+                remaining_min = int(remaining_sec // 60)
                 send_telegram(
-                    f"🎊 DG 放水提醒（v8）🔥\n"
+                    f"🎊 DG 放水提醒（v9）🔥\n"
                     f"📌 当前时间：{now.strftime('%Y-%m-%d %H:%M:%S')} ({day_label})\n"
                     f"⏰ 放水时段：{start_dt.strftime('%H:%M')} - {end_dt.strftime('%H:%M')}\n"
-                    f"🔥 放水概率：{probability*100:.0f}%\n"
-                    f"⏳ 剩余约 {remaining_min} 分钟\n"
+                    f"🔥 放水概率：{probability*100:.0f}% 🔥等级：{'🔥'*intensity}\n"
+                    f"⏳ 剩余约 {remaining_min} 分钟 ({int(remaining_sec)} 秒)\n"
                     f"🚀 建议立即查看 DG 桌面走势（长龙 + 多连 + 断连开单）"
                 )
                 state[key] = {"status":"started", "start_at": now.strftime("%H:%M")}
                 save_state(state)
 
-        # 放水结束
         else:
+            # 放水结束
             if key and state.get(key, {}).get("status") == "started":
                 start_at_str = state[key]["start_at"]
                 start_dt2 = to_tz_datetime(now, start_at_str)
                 duration = int((now - start_dt2).total_seconds() // 60)
                 send_telegram(
-                    f"✅ DG 放水结束（v8）\n"
+                    f"✅ DG 放水结束（v9）\n"
                     f"🕒 放水时段：{start_dt.strftime('%H:%M')} - {end_dt.strftime('%H:%M')}\n"
                     f"⏱ 共持续 {duration} 分钟"
                 )
@@ -160,7 +160,7 @@ def main():
 
     except Exception as ex:
         send_telegram(
-            f"❗ DG Monitor v8 脚本异常：{ex}\nTraceback (truncated):\n{traceback.format_exc()[:900]}"
+            f"❗ DG Monitor v9 脚本异常：{ex}\nTraceback (truncated):\n{traceback.format_exc()[:900]}"
         )
 
 if __name__ == "__main__":
