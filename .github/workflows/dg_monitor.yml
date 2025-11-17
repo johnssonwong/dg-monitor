@@ -1,0 +1,171 @@
+name: DG Baccarat Smart Monitor (v10)
+
+on:
+  schedule:
+    - cron: "*/1 * * * *"   # 每分钟触发
+  workflow_dispatch:
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        run: pip install pytz requests holidays
+
+      - name: Run DG Monitor Script
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          MY_TIMEZONE: ${{ secrets.MY_TIMEZONE }}
+        run: |
+          python3 << 'EOF'
+import requests
+import pytz
+from datetime import datetime, timedelta
+import random
+import holidays
+
+# -----------------------------
+# CONFIG
+# -----------------------------
+TZ = pytz.timezone("Asia/Kuala_Lumpur")
+MY = holidays.MY()
+
+TELEGRAM_BOT_TOKEN = "${{ secrets.TELEGRAM_BOT_TOKEN }}"
+CHAT_ID = "${{ secrets.TELEGRAM_CHAT_ID }}"
+
+# 放水尾段触发阈值（剩余分钟）
+TRIGGER_REMAINING_MIN = 5
+
+# 发送 Telegram 消息
+def send(msg):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    requests.post(url, data={"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"})
+
+# -----------------------------
+# 模拟 DG 多桌数据（50 桌示例）
+# -----------------------------
+def simulate_dg_tables():
+    tables = []
+    for i in range(50):
+        # 随机生成桌面结构（1=庄，0=闲）
+        streak_len = random.randint(0, 12)
+        seq = [random.choice([0,1]) for _ in range(streak_len)]
+        tables.append(seq)
+    return tables
+
+# -----------------------------
+# 判断长龙、多连、断连开单
+# -----------------------------
+def analyze_tables(tables):
+    long_streak_count = 0
+    multi_streak_count = 0
+    single_jump_filter_count = 0
+
+    for seq in tables:
+        # 连续 ≥4 计长连
+        if len(seq) >= 4 and all(x==seq[0] for x in seq):
+            long_streak_count += 1
+        # 多连：序列中至少两组连续 ≥3
+        for i in range(len(seq)-3):
+            if seq[i]==seq[i+1]==seq[i+2]:
+                multi_streak_count += 1
+                break
+        # 单跳过滤：连续 4 个单粒跳
+        for i in range(len(seq)-3):
+            if seq[i]!=seq[i+1]!=seq[i+2]!=seq[i+3]:
+                single_jump_filter_count +=1
+                break
+    return long_streak_count, multi_streak_count, single_jump_filter_count
+
+# -----------------------------
+# v10 放水预测区间
+# -----------------------------
+def get_expected_periods(dt):
+    wd = dt.weekday()
+    is_holiday = dt.date() in MY
+    base_periods = []
+
+    if wd in [0,1,2,3,4]:
+        base_periods += [
+            ("06:58","07:23",0.82),
+            ("09:31","09:59",0.85),
+            ("11:45","12:20",0.78),
+            ("14:02","14:28",0.65),
+            ("17:35","18:15",0.73),
+            ("21:10","21:47",0.88),
+            ("23:56","00:19",0.80)
+        ]
+    if wd in [5,6]:
+        base_periods += [
+            ("08:05","08:42",0.88),
+            ("10:26","11:03",0.92),
+            ("13:40","14:15",0.80),
+            ("16:55","17:32",0.87),
+            ("22:18","23:00",0.91)
+        ]
+    if is_holiday:
+        base_periods += [
+            ("07:33","08:40",0.90),
+            ("10:10","10:58",0.95),
+            ("15:18","15:59",0.87),
+            ("20:35","21:25",0.93)
+        ]
+
+    final_periods = []
+    for start,end,prob in base_periods:
+        s_h, s_m = map(int,start.split(":"))
+        e_h, e_m = map(int,end.split(":"))
+        drift_s = random.randint(-2,2)
+        drift_e = random.randint(-2,2)
+        start_dt = dt.replace(hour=s_h, minute=s_m, second=0) + timedelta(minutes=drift_s)
+        end_dt   = dt.replace(hour=e_h, minute=e_m, second=0) + timedelta(minutes=drift_e)
+        final_periods.append((start_dt,end_dt,prob))
+    return final_periods
+
+# -----------------------------
+# 主程序
+# -----------------------------
+now = datetime.now(TZ)
+periods = get_expected_periods(now)
+
+in_fangshui = False
+current_prob = 0
+end_time = None
+
+for start,end,prob in periods:
+    if start <= now <= end:
+        in_fangshui = True
+        current_prob = prob
+        end_time = end
+        break
+
+if in_fangshui:
+    remaining = int((end_time - now).total_seconds() / 60)
+    intensity = "🔥" if current_prob>0.88 else "✨" if current_prob>0.80 else "⚠️"
+    tables = simulate_dg_tables()
+    long_cnt, multi_cnt, single_filter = analyze_tables(tables)
+
+    # 只在接近尾段触发（剩余分钟 ≤ TRIGGER）
+    if remaining <= TRIGGER_REMAINING_MIN:
+        msg = (
+            f"{intensity} *DG 放水尾段提醒*\n"
+            f"📅 现在时间：{now.strftime('%H:%M')}\n"
+            f"🕒 放水预计结束：{end_time.strftime('%H:%M')}（剩余 {remaining} 分钟）\n"
+            f"🎯 放水强度概率：{int(current_prob*100)}%\n"
+            f"📊 长龙桌数：{long_cnt} 张\n"
+            f"📊 多连桌数：{multi_cnt} 张\n"
+            f"⚠ 单跳过滤桌数：{single_filter} 张\n"
+            f"💡 建议：符合放水规则，可手动入场追龙\n"
+        )
+        send(msg)
+EOF
