@@ -1,76 +1,109 @@
-import time
+import os
 import datetime
+import random
 import requests
-import math
 
-# ---------------- 用户配置 ----------------
-TELEGRAM_TOKEN = "你的TelegramBotToken"
-CHAT_ID = "你的ChatID"
-CHECK_INTERVAL = 300  # 每 5 分钟检查一次
-HISTORICAL_DATA = "模拟历史胜率数据"  # 可以替换为你实际数据源
-# 放水时间段配置（根据周一至周五、周末、公共假期）
-TIME_WINDOWS = {
-    "weekday": [("10:00", "12:00"), ("14:00", "16:00"), ("20:00", "22:00")],
-    "weekend": [("11:00", "13:00"), ("15:00", "17:00"), ("21:00", "23:00")],
-    "holiday": [("09:00", "11:00"), ("13:00", "15:00"), ("19:00", "21:00")]
-}
+# Telegram 配置
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
 
-# 模拟桌子数据结构
-TABLES = [
-    {"name": "桌1", "data": []},
-    {"name": "桌2", "data": []},
-    {"name": "桌3", "data": []},
+# 放水时段配置（历史数据概率预测）
+# 示例：你可以自行根据历史数据调整时间段和强度
+# 时间格式：('开始时间', '结束时间', '强度')，强度 'high' = 2🔥，'medium' = 1🔥
+WEEKDAY_PERIODS = [
+    ('10:00', '12:00', 'high'),
+    ('14:00', '16:00', 'medium'),
+    ('20:00', '22:00', 'high')
 ]
 
-# ---------------- 工具函数 ----------------
-def is_holiday(date):
-    # 可扩展公共假期逻辑
-    return date.weekday() >= 5  # 暂时周六日算假期
+WEEKEND_PERIODS = [
+    ('11:00', '13:00', 'high'),
+    ('15:00', '17:00', 'medium'),
+    ('21:00', '23:00', 'high')
+]
 
-def is_time_in_window(start, end):
+HOLIDAY_PERIODS = [
+    ('10:00', '12:00', 'high'),
+    ('14:00', '16:00', 'high'),
+    ('20:00', '22:00', 'high')
+]
+
+# 模拟平台历史胜率 / 放水概率
+def get_platform_win_rate():
+    # 高峰期概率低一点，低峰期概率高一点
+    hour = datetime.datetime.now().hour
+    if 11 <= hour <= 14 or 20 <= hour <= 22:
+        return random.uniform(0.7, 0.85)  # 强放水
+    else:
+        return random.uniform(0.55, 0.7)   # 中等放水
+
+# 判断是否在放水时间段
+def is_in_period(periods):
     now = datetime.datetime.now().time()
-    start_time = datetime.datetime.strptime(start, "%H:%M").time()
-    end_time = datetime.datetime.strptime(end, "%H:%M").time()
-    return start_time <= now <= end_time
+    for start_str, end_str, strength in periods:
+        start = datetime.datetime.strptime(start_str, "%H:%M").time()
+        end = datetime.datetime.strptime(end_str, "%H:%M").time()
+        if start <= now <= end:
+            return strength
+    return None
 
-def send_telegram(message):
+# 判断今天属于哪类日子
+def get_today_periods():
+    today = datetime.datetime.today()
+    weekday = today.weekday()
+    # 可根据你自己设置的节假日名单判断
+    holidays = []  # 例: ['2025-12-25', '2025-01-01']
+    if today.strftime("%Y-%m-%d") in holidays:
+        return HOLIDAY_PERIODS
+    elif weekday < 5:
+        return WEEKDAY_PERIODS
+    else:
+        return WEEKEND_PERIODS
+
+# 模拟判断牌桌策略（长连、多连、断连开单）
+def evaluate_table_strategy():
+    # 模拟结果：True=可入场，False=断连开单或不可入场
+    outcome = random.choices(
+        ['long_streak', 'multi_streak', 'break_single', 'empty_table'],
+        weights=[0.3, 0.2, 0.3, 0.2],
+        k=1
+    )[0]
+    return outcome
+
+# 发送 Telegram 消息
+def send_telegram(msg):
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        print("Telegram 配置未设置，无法发送消息")
+        return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "HTML"}
+    payload = {
+        'chat_id': CHAT_ID,
+        'text': msg,
+        'parse_mode': 'HTML'
+    }
     try:
-        requests.post(url, data=payload, timeout=10)
+        requests.post(url, data=payload, timeout=5)
     except Exception as e:
-        print(f"Telegram发送失败: {e}")
+        print("Telegram 发送异常:", e)
 
-def analyze_tables():
-    # 模拟按照你的策略判断
-    result = []
-    for table in TABLES:
-        data = table["data"]
-        # 这里用随机数据/概率模拟
-        combined = 60  # 假设计算胜率的历史数据指标
-        prob = min(99, math.floor((combined / 120.0) * 100))
-        # 判断放水强弱
-        if prob >= 80:
-            emoji = "🔥🔥"
-        elif prob >= 60:
-            emoji = "🔥"
-        else:
-            emoji = ""
-        result.append(f"{table['name']} 胜率: {prob}% {emoji}")
-    return "\n".join(result)
-
-# ---------------- 主循环 ----------------
 def main():
-    while True:
-        now = datetime.datetime.now()
-        weekday_type = "holiday" if is_holiday(now) else ("weekend" if now.weekday() >=5 else "weekday")
-        windows = TIME_WINDOWS[weekday_type]
-
-        for start, end in windows:
-            if is_time_in_window(start, end):
-                message = f"🎯 放水预测时间段: {start}-{end}\n{analyze_tables()}"
-                send_telegram(message)
-        time.sleep(CHECK_INTERVAL)
+    periods = get_today_periods()
+    strength = is_in_period(periods)
+    if strength:
+        # 平台胜率预测
+        win_rate = get_platform_win_rate()
+        table_status = evaluate_table_strategy()
+        emoji = '🔥🔥' if strength == 'high' else '🔥'
+        msg = f"💰 放水预测开始\n时间: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        msg += f"强度: {strength} {emoji}\n"
+        msg += f"平台胜率参考: {win_rate:.2f}\n"
+        msg += f"入场策略判断: {table_status}\n"
+        if table_status == 'break_single':
+            msg += "⚠️ 当前桌断连开单，请寻找下一桌"
+        send_telegram(msg)
+        print(msg)
+    else:
+        print(f"{datetime.datetime.now()}: 当前不在放水时段，无需提醒。")
 
 if __name__ == "__main__":
     main()
