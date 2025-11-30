@@ -1,30 +1,25 @@
-name: DG Monitor V12
+name: DG Baccarat Smart Monitor (v10.2)
 
 on:
   schedule:
-    - cron: "*/1 * * * *"   # 每分钟触发
+    - cron: "*/1 * * * *"  # 每分钟触发
   workflow_dispatch:
 
 jobs:
-  run:
+  monitor:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v4
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
-      - name: Install dependencies
-        run: pip install requests pytz holidays
+      - name: Install Dependencies
+        run: pip install pytz requests holidays
 
-      - name: Run DG Monitor V12
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          MY_TIMEZONE: Asia/Kuala_Lumpur
-          DG_ROAD_API_URL: ${{ secrets.DG_ROAD_API_URL }} # optional if you add a real source later
-        run: |
-          python3 dg_monitor_v12.py
+      - name: Run DG Monitor Script
+        run: python3 dg_monitor.py
