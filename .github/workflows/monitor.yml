@@ -2,20 +2,21 @@ name: DG Monitor
 
 on:
   schedule:
-    - cron: '*/5 * * * *'  # 每 5 分钟运行一次
+    # 每 5 分钟运行一次脚本
+    - cron: '*/5 * * * *'
   workflow_dispatch:
 
 jobs:
-  run-monitor:
+  monitor:
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v3
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: 3.11
+          python-version: '3.11'
 
       - name: Install dependencies
         run: |
@@ -23,7 +24,8 @@ jobs:
           pip install requests
 
       - name: Run DG Monitor
-        run: python monitor.py
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
+        run: |
+          python monitor.py
