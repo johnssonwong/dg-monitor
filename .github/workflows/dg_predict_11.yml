@@ -1,0 +1,29 @@
+name: DG Predict 11 Tables Monitor
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'   # 每 5 分钟运行一次
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Run predictor
+        run: |
+          python dg_predict_11_final.py
